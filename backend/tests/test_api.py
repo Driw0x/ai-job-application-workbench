@@ -1,4 +1,5 @@
 from hashlib import sha256
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from shutil import copy2
@@ -347,6 +348,131 @@ def test_closed_tracking_and_channel_detection() -> None:
     assert detect_application_channel("https://www.welcometothejungle.com/fr/companies/x/jobs/y") == "Welcome to the Jungle"
     assert detect_application_channel("https://careers.example.com/job/42") == "Career website"
     assert detect_application_channel("https://example.com/offer/42") is None
+
+
+@pytest.fixture
+def tracking_clock(monkeypatch) -> datetime:
+    current = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
+
+    class TrackingDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", TrackingDateTime)
+    return current
+
+
+@pytest.mark.parametrize("status,age,due", [
+    ("ACKNOWLEDGED", timedelta(days=11), True),
+    ("ACKNOWLEDGED", timedelta(days=2), False),
+    ("ACKNOWLEDGED", timedelta(days=10), True),
+    ("ACKNOWLEDGED", timedelta(days=10, seconds=-1), False),
+    ("ACKNOWLEDGED", None, False),
+    ("SENT", timedelta(days=11), True),
+    ("SENT", timedelta(days=2), False),
+    ("SENT", timedelta(days=10), True),
+])
+def test_followups_use_status_event_and_share_deadline(tmp_path, tracking_clock, status, age, due):
+    api = client(tmp_path)
+    application_id = create(api)["id"]
+    sent_at = tracking_clock - (timedelta(days=40) if status == "ACKNOWLEDGED" else age)
+    timestamp = tracking_clock - age if age is not None else None
+    expected_date = (timestamp + timedelta(days=10)).isoformat() if timestamp else None
+    expected_action = (
+        "Relancer si aucune suite à l’accusé de réception"
+        if status == "ACKNOWLEDGED" else "Follow up if no response"
+    )
+    with connect(tmp_path / "test.db") as db:
+        # Existing applications may have a stale stored action and deadline.
+        db.execute(
+            "UPDATE applications SET status=?, sent_at=?, next_action='Wait for the next step', next_action_at=?, updated_at=? WHERE id=?",
+            (status, sent_at.isoformat(), sent_at.isoformat(), (tracking_clock - timedelta(days=1)).isoformat(), application_id),
+        )
+        if timestamp:
+            main.add_event(db, application_id, status, created_at=timestamp.isoformat())
+        db.commit()
+
+    def check_deadline():
+        stats = api.get("/stats").json()
+        assert [item["id"] for item in stats["followups"]] == ([application_id] if due else [])
+        views = [api.get(f"/applications/{application_id}").json(), api.get("/applications").json()[0]]
+        views.extend(stats["followups"])
+        views.extend(stats["today"])
+        for item in views:
+            assert item["next_action"] == expected_action
+            assert item["next_action_at"] == expected_date
+
+    check_deadline()
+    # A detail form also submits its displayed action and date with the notes.
+    updated = api.patch(f"/applications/{application_id}", json={
+        "notes": "Synthetic tracking note",
+        "next_action": "Stale action",
+        "next_action_at": (tracking_clock + timedelta(days=30)).isoformat(),
+    })
+    assert updated.status_code == 200
+    assert updated.json()["next_action_at"] == expected_date
+    with connect(tmp_path / "test.db") as db:
+        assert main.get_application(db, application_id)["updated_at"] == tracking_clock.isoformat()
+    check_deadline()
+
+
+def test_new_acknowledgment_restarts_followup_delay(tmp_path, tracking_clock):
+    api = client(tmp_path)
+    application_id = create(api)["id"]
+    with connect(tmp_path / "test.db") as db:
+        db.execute("UPDATE applications SET status='SENT', sent_at=? WHERE id=?", (
+            (tracking_clock - timedelta(days=40)).isoformat(), application_id,
+        ))
+        db.commit()
+    first = api.post(f"/applications/{application_id}/status", json={"status": "ACKNOWLEDGED"})
+    assert first.status_code == 200
+    assert first.json()["next_action_at"] == (tracking_clock + timedelta(days=10)).isoformat()
+    with connect(tmp_path / "test.db") as db:
+        db.execute("UPDATE events SET created_at=? WHERE application_id=? AND event_type='ACKNOWLEDGED'", (
+            (tracking_clock - timedelta(days=11)).isoformat(), application_id,
+        ))
+        db.commit()
+    assert [item["id"] for item in api.get("/stats").json()["followups"]] == [application_id]
+
+    result = api.post(f"/applications/{application_id}/status", json={"status": "ACKNOWLEDGED"})
+    assert result.status_code == 200
+    expected_date = (tracking_clock + timedelta(days=10)).isoformat()
+    assert result.json()["next_action_at"] == expected_date
+    assert api.get(f"/applications/{application_id}").json()["next_action_at"] == expected_date
+    assert api.get("/applications").json()[0]["next_action_at"] == expected_date
+    assert api.get("/stats").json()["followups"] == []
+    events = api.get(f"/applications/{application_id}/events").json()
+    assert len([event for event in events if event["event_type"] == "ACKNOWLEDGED"]) == 2
+
+
+@pytest.mark.parametrize("target", [
+    "HR_INTERVIEW", "TECH_INTERVIEW", "FINAL_INTERVIEW", "OFFER",
+    "REJECTED", "WITHDRAWN", "NO_RESPONSE", "IGNORED", "DELETED",
+])
+def test_acknowledged_followups_exclude_interviews_closed_and_deleted(tmp_path, tracking_clock, target):
+    api = client(tmp_path)
+    application_id = create(api)["id"]
+    with connect(tmp_path / "test.db") as db:
+        db.execute("UPDATE applications SET status='ACKNOWLEDGED' WHERE id=?", (application_id,))
+        main.add_event(db, application_id, "ACKNOWLEDGED", created_at=(tracking_clock - timedelta(days=11)).isoformat())
+        db.commit()
+    assert len(api.get("/stats").json()["followups"]) == 1
+    if target in {"DELETED", "IGNORED"}:
+        # Seed historical exclusions; current workflow restricts Trash and Ignore.
+        with connect(tmp_path / "test.db") as db:
+            if target == "DELETED":
+                db.execute("UPDATE applications SET deleted_at=? WHERE id=?", (tracking_clock.isoformat(), application_id))
+            else:
+                db.execute("UPDATE applications SET status='IGNORED' WHERE id=?", (application_id,))
+            db.commit()
+    else:
+        if target in {"FINAL_INTERVIEW", "OFFER"}:
+            assert api.post(f"/applications/{application_id}/status", json={"status": "HR_INTERVIEW"}).status_code == 200
+        response = api.post(f"/applications/{application_id}/status", json={"status": target})
+        assert response.status_code == 200
+    assert api.get("/stats").json()["followups"] == []
+    assert api.get("/stats").json()["today"] == []
 
 
 def test_reset_to_prepared_is_safe_idempotent_and_preserves_artifacts(tmp_path: Path) -> None:

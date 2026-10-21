@@ -99,7 +99,7 @@ TRANSITIONS = {
     "APPROVED": {"SUBMITTING", "SENT", "PREPARED", "WITHDRAWN"},
     "SUBMITTING": {"SENT", "APPROVED"},
     "SENT": {"ACKNOWLEDGED", "HR_INTERVIEW", "TECH_INTERVIEW", "REJECTED", "WITHDRAWN", "NO_RESPONSE"},
-    "ACKNOWLEDGED": {"HR_INTERVIEW", "TECH_INTERVIEW", "REJECTED", "WITHDRAWN", "NO_RESPONSE"},
+    "ACKNOWLEDGED": {"ACKNOWLEDGED", "HR_INTERVIEW", "TECH_INTERVIEW", "REJECTED", "WITHDRAWN", "NO_RESPONSE"},
     "HR_INTERVIEW": {"TECH_INTERVIEW", "FINAL_INTERVIEW", "OFFER", "REJECTED", "WITHDRAWN"},
     "TECH_INTERVIEW": {"FINAL_INTERVIEW", "OFFER", "REJECTED", "WITHDRAWN"},
     "FINAL_INTERVIEW": {"OFFER", "REJECTED", "WITHDRAWN"},
@@ -273,15 +273,26 @@ def tracking_for_status(status: str, timestamp: str | None = None) -> tuple[str 
         "APPROVED": "Complete submission on the website, then confirm",
         "SUBMITTING": "Complete submission on the website, then confirm",
         "SENT": "Follow up if no response",
-        "ACKNOWLEDGED": "Wait for the next step",
+        "ACKNOWLEDGED": "Relancer si aucune suite à l’accusé de réception",
         "OFFER": "Review the offer",
     }
     action = "Prepare for interview" if status in INTERVIEW_STATUSES else actions.get(status)
     next_action_at = (
         (datetime.fromisoformat(timestamp) + timedelta(days=10)).isoformat(timespec="seconds")
-        if status == "SENT" and timestamp else None
+        if status in {"SENT", "ACKNOWLEDGED"} and timestamp else None
     )
     return action, next_action_at
+
+
+def application_tracking(db: sqlite3.Connection, row: sqlite3.Row) -> tuple[str | None, str | None]:
+    timestamp = row["sent_at"]
+    if row["status"] == "ACKNOWLEDGED":
+        event = db.execute(
+            "SELECT created_at FROM events WHERE application_id=? AND event_type='ACKNOWLEDGED' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        timestamp = event["created_at"] if event else None
+    return tracking_for_status(row["status"], timestamp)
 
 
 def preparation_error(
@@ -908,7 +919,7 @@ def insert_application(
     created_at = timestamp or now()
     normalized_url = normalize_url(data["url"])
     eligibility_status, eligibility_reason = evaluate_offer_eligibility(data)
-    next_action, next_action_at = tracking_for_status(status, created_at if status == "SENT" else None)
+    next_action, next_action_at = tracking_for_status(status, created_at if status in {"SENT", "ACKNOWLEDGED"} else None)
     fields = {
         "company": data["company"].strip(),
         "position": data["position"].strip(),
@@ -1110,12 +1121,12 @@ def change_status(
         raise HTTPException(409, f"Shortlisting not allowed : {row['eligibility_reason']}")
     timestamp = now()
     sent_at = timestamp if target == "SENT" else row["sent_at"]
-    next_action, next_action_at = tracking_for_status(target, sent_at if target == "SENT" else None)
+    next_action, next_action_at = tracking_for_status(target, timestamp if target == "ACKNOWLEDGED" else sent_at)
     db.execute(
         "UPDATE applications SET status = ?, sent_at = ?, next_action = ?, next_action_at = ?, updated_at = ? WHERE id = ?",
         (target, sent_at, next_action, next_action_at, timestamp, application_id),
     )
-    add_event(db, application_id, EVENT_FOR_STATUS[target], details or f"{current} to {target}")
+    add_event(db, application_id, EVENT_FOR_STATUS[target], details or f"{current} to {target}", timestamp)
     db.commit()
     if target in INACTIVE_STATUSES:
         try:
@@ -1326,14 +1337,14 @@ def create_app(
             else "Preparation needs retry" if result["preparation_state"] == "failed"
             else None
         )
-        action, sent_follow_up = tracking_for_status(row["status"], row["sent_at"])
+        action, follow_up = application_tracking(db, row)
         result["next_action"] = (
             "Retry preparation"
             if result["preparation_state"] == "failed"
             else action
         )
-        if row["status"] == "SENT":
-            result["next_action_at"] = sent_follow_up
+        if row["status"] in {"SENT", "ACKNOWLEDGED"}:
+            result["next_action_at"] = follow_up
         elif row["status"] in {"REJECTED", "WITHDRAWN", "NO_RESPONSE", "IGNORED"}:
             result["next_action_at"] = None
         result["application_channel"] = row["application_channel"] or detect_application_channel(row["url"])
@@ -2376,10 +2387,10 @@ def create_app(
                     if address == application["company_postal_address"]
                     else int(address is not None)
                 )
-            expected_action, expected_date = tracking_for_status(application["status"], application["sent_at"])
+            expected_action, expected_date = application_tracking(db, application)
             if "next_action" in values:
                 values["next_action"] = expected_action
-            if application["status"] == "SENT":
+            if application["status"] in {"SENT", "ACKNOWLEDGED"}:
                 values["next_action_at"] = expected_date
             elif application["status"] in {"REJECTED", "WITHDRAWN", "NO_RESPONSE", "IGNORED"}:
                 values["next_action_at"] = None
@@ -3425,13 +3436,18 @@ def create_app(
     def stats() -> dict[str, Any]:
         with closing(database()) as db:
             counts = {row["status"]: row["count"] for row in db.execute("SELECT status, COUNT(*) AS count FROM applications WHERE deleted_at IS NULL GROUP BY status")}
-            rows = [row_dict(row) for row in db.execute("SELECT * FROM applications WHERE deleted_at IS NULL ORDER BY updated_at DESC")]
+            rows = []
+            for row in db.execute("SELECT * FROM applications WHERE deleted_at IS NULL ORDER BY updated_at DESC"):
+                item = row_dict(row)
+                if item["status"] in {"SENT", "ACKNOWLEDGED"}:
+                    item["next_action"], item["next_action_at"] = application_tracking(db, row)
+                rows.append(item)
         current = datetime.now(timezone.utc)
         followups, today, interviews = [], [], []
         for item in rows:
-            if item["status"] == "SENT" and item["sent_at"]:
-                sent = datetime.fromisoformat(item["sent_at"])
-                if sent <= current - timedelta(days=10):
+            if item["status"] in {"SENT", "ACKNOWLEDGED"} and item["next_action_at"]:
+                due = datetime.fromisoformat(item["next_action_at"])
+                if due <= current:
                     followups.append(item)
             if item["next_action_at"] and item["next_action_at"][:10] <= current.date().isoformat():
                 today.append(item)

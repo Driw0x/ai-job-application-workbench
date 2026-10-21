@@ -849,6 +849,38 @@ describe("routing SPA", () => {
     expect(host.textContent).toContain("Upcoming interviews");
   });
 
+  it.each(["SENT", "ACKNOWLEDGED"])("partage action et échéance entre dashboard, liste et détail : %s", async status => {
+    const tracked = {
+      ...application, status, next_action_at: "2026-10-21T12:00:00+00:00",
+      next_action: status === "SENT" ? "Follow up if no response" : "Relancer si aucune suite à l’accusé de réception",
+    };
+    const deadline = new Intl.DateTimeFormat("en-US", { dateStyle: "short", timeStyle: "short" }).format(new Date(tracked.next_action_at));
+    const fetchMock = mockApi();
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => String(input).endsWith("/stats")
+      ? { ok: true, status: 200, json: async () => ({ phases: { search: 0, ignored: 0, validation: 0, send: 0, tracking: 1, rejected: 0 }, followups: [tracked], today: [], upcoming_interviews: [] }) } as Response
+      : original(input, init));
+    await act(async () => root.render(<BrowserRouter><App /></BrowserRouter>)); await flush();
+    const followups = [...host.querySelectorAll("h3")].find(item => item.textContent === "Suggested follow-ups after 10 days")!.closest("section")!;
+    expect(followups.textContent).toContain(`${tracked.next_action} · ${deadline}`);
+
+    await act(async () => root.render(<ApplicationList applications={[tracked]} open={vi.fn()} />));
+    expect(host.querySelector("tbody tr td:last-child")?.textContent).toBe(`${tracked.next_action} · ${deadline}`);
+
+    const mutate = vi.fn().mockResolvedValue(null);
+    await act(async () => root.render(<Detail application={tracked} openDocument={vi.fn()} mutate={mutate} save={vi.fn()} prepare={vi.fn()} preparing={false} back={vi.fn()} />)); await flush();
+    const nextAction = [...host.querySelectorAll("label")].find(label => label.firstChild?.textContent === "Next action")!.querySelector("input")!;
+    const nextDate = [...host.querySelectorAll("label")].find(label => label.firstChild?.textContent === "Next action date")!.querySelector("input")!;
+    expect(nextAction.value).toBe(tracked.next_action);
+    expect(nextDate.value).toBe(deadline);
+    expect(nextDate.readOnly).toBe(true);
+    expect(mutate).not.toHaveBeenCalled();
+    if (status === "ACKNOWLEDGED") {
+      await act(async () => [...host.querySelectorAll("button")].find(button => button.textContent === "New acknowledgment")!.click());
+      expect(mutate).toHaveBeenCalledWith("/applications/7/status", { status: "ACKNOWLEDGED" });
+    }
+  });
+
   describe("récence des new jobs", () => {
     const input = () => host.querySelector('input[aria-label="Maximum age in days"]') as HTMLInputElement;
     const searchButton = () => host.querySelector(".search-launch .primary") as HTMLButtonElement;
