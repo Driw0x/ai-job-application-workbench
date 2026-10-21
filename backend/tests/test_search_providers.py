@@ -67,6 +67,48 @@ def test_searxng_normalizes_and_deduplicates_results():
     assert provider.last_stats["search_call_count"] == 1
 
 
+@pytest.mark.parametrize("count", [100, 137])
+@pytest.mark.parametrize("mode", ["SEARXNG", "AI_DIRECT"])
+def test_search_retains_all_valid_unique_results_without_a_default_limit(mode, count):
+    urls = [f"https://jobs.example.test/offer-{index}" for index in range(count)]
+    payload = {"results": [
+        {"title": "Stage IA", "url": url, "snippet": "Mission ML", "content": "Mission ML"}
+        for url in urls
+    ] + [{"url": urls[-1] + "?utm_source=mirror"}, {"url": "javascript:alert(1)"}]}
+    calls = []
+
+    if mode == "SEARXNG":
+        def handler(request):
+            calls.append(request)
+            assert dict(request.url.params) == {
+                "q": "stage IA Paris", "format": "json", "categories": "general",
+            }
+            return httpx.Response(200, json=payload, request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+            provider = SearXNGProvider("http://localhost:8080", http)
+            results = provider.search("stage IA Paris")
+    else:
+        class Provider:
+            def run(self, prompt, *_args, **kwargs):
+                calls.append(prompt)
+                assert "Retourne toutes les offres réellement trouvées." in prompt
+                assert "au maximum" not in prompt
+                assert kwargs["web_search"] is True
+                return payload
+
+        provider = AIWebSearchProvider(Provider(), "gemini_api", "gemini-test")
+        results = provider.search("stage IA Paris")
+
+    assert [item.url for item in results] == urls
+    assert len(calls) == provider.last_stats["search_call_count"] == 1
+    assert provider.last_stats["raw_result_count"] == count + 2
+    assert provider.last_stats["extracted_url_count"] == count + 1
+    assert provider.last_stats["admitted_result_count"] == count
+    assert provider.last_stats["intra_query_duplicate_count"] == 1
+    assert provider.last_stats["invalid_url_count"] == 1
+
+
 def test_searxng_empty_response_is_valid():
     provider = SearXNGProvider("http://localhost:8080", httpx.Client(transport=httpx.MockTransport(
         lambda request: httpx.Response(200, json={"results": []}, request=request),

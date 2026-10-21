@@ -318,11 +318,12 @@ Le CV n'est ni un README, ni un rapport de benchmark, ni un journal d'expérimen
 - Si le rendu devient trop dense, privilégie des descriptions plus concises avant de réduire le nombre de projets.
 - Conserve 4 catégories de compétences, avec 3 à 5 compétences documentées chacune, classées par pertinence décroissante
   pour l'offre puis pour le positionnement du candidat. Place les compétences explicitement demandées et les acquis
-  essentiels en tête ; les éléments redondants ou secondaires en fin seront retirés un par un pour équilibrer les colonnes.
-  Ne supprime aucune catégorie, ni Langues, Centres d'intérêt ou Liens. Ne descends jamais sous 3 compétences par catégorie.
-- Vise une page et deux colonnes de hauteur proche. Conserve proportions, typographie, marges et espacements du template.
-  Réduis d'abord les compétences secondaires, puis condense les formulations trop longues, puis seulement les espacements
-  compatibles avec le template ; adapte la sélection en dernier recours. N'ajoute ni texte ni espace artificiel.
+  essentiels en tête. Conserve toutes les compétences sélectionnées.
+  Ne supprime aucune catégorie, ni Langues ou Centres d'intérêt.
+- Utilise le modèle ATS A4 portrait, une seule colonne, sans tableau ni zone de texte flottante.
+  Ordre : PROFIL, COMPÉTENCES, PROJETS, FORMATION, EXPÉRIENCES, LANGUES, CENTRES D'INTÉRÊT.
+  Le titre est toujours PROJETS. Coordonnées et liens cliquables uniquement sur une ligne dans l'en-tête.
+  Vise une page lorsque le contenu le permet ; accepte plusieurs pages plutôt que supprimer des informations importantes.
 - Utilise un style professionnel adapté au parcours documenté du candidat : lisible rapidement, techniquement crédible,
   sans jargon inutile, accumulation de noms techniques ou longue succession de détails séparés par des virgules.
 - Conserve une valeur numérique seulement si elle apporte une preuve utile au recruteur. Maximum une métrique

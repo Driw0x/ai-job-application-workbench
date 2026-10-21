@@ -31,7 +31,7 @@ from app.main import (
     offer_freshness_reason, supported_reasoning_efforts, verify_discovery_results,
 )
 from app.offer_verification import OfferVerificationResult
-from app.search_providers import SearchProviderUnavailableError, SearchResult
+from app.search_providers import SearchProviderUnavailableError, SearchResult, SearXNGProvider
 
 
 class FakeAuth:
@@ -100,10 +100,10 @@ class FakeSearchProvider:
         self.queries = []
     def test(self):
         if self.error: raise self.error
-    def search(self, query, limit=20):
+    def search(self, query, limit=None):
         self.queries.append(query)
         if self.error: raise self.error
-        return self.results[:limit]
+        return self.results if limit is None else self.results[:limit]
 
 
 def search_result(title: str, url: str, snippet: str = "") -> SearchResult:
@@ -166,12 +166,12 @@ def test_screening_normal_batch_has_no_retry():
 
 def test_screening_processes_all_candidates_in_multiple_batches():
     calls = []
-    candidates = screening_candidates(65)
+    candidates = screening_candidates(100)
     decisions, metrics, _ = screen_candidate_batches(
         candidates, lambda batch, number, retry: (calls.append(len(batch)) or parsed_batch(batch, decisions_for(batch))),
     )
-    assert calls == [30, 30, 5]
-    assert len(decisions) == metrics["ai_decision_count"] == 65 and metrics["ai_batch_count"] == 3
+    assert calls == [30, 30, 30, 10]
+    assert len(decisions) == metrics["ai_decision_count"] == 100 and metrics["ai_batch_count"] == 4
 
 
 @pytest.mark.parametrize("missing_count", [1, 3])
@@ -269,7 +269,7 @@ class ControlledCodex(FakeCodex):
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             self.condition.notify_all()
-        self.releases[name].wait(5)
+        assert self.releases[name].wait(60), "Timed out waiting for a simulated preparation"
         with self.condition:
             self.active -= 1
         if name in self.fail:
@@ -1506,6 +1506,71 @@ def test_discovery_inserts_detected(tmp_path):
     assert api.get("/applications").json()[0]["status"] == "DETECTED"
 
 
+def test_discovery_retains_100_valid_offers_without_losing_existing_filters(tmp_path):
+    offers = [found_offer(f"https://jobs.example.test/jobs/stage-ia-{index:05d}") for index in range(100)]
+    known_url = "https://jobs.example.test/jobs/stage-known-99999"
+    rejected_url = "https://jobs.example.test/jobs/stage-sales-54321"
+    non_job_url = "https://university.test/formation/master-ia"
+    results = [
+        {"title": "Stage connu", "url": known_url},
+        *[{"title": offer["title"], "url": offer["url"]} for offer in offers],
+        {"title": "Doublon tracking", "url": offers[0]["url"] + "?utm_source=mirror"},
+        {"title": "Master IA", "url": non_job_url},
+        {"title": "Stage commercial", "url": rejected_url},
+        {"title": "URL invalide", "url": "javascript:alert(1)"},
+    ]
+    search_requests = []
+
+    def search_handler(request):
+        search_requests.append(request)
+        assert request.url.path == "/search"
+        assert set(request.url.params) == {"q", "format", "categories"}
+        return httpx.Response(200, json={"results": results}, request=request)
+
+    api, app = client(tmp_path)
+    assert api.post("/applications", json={
+        "company": "Existing", "position": "Stage connu", "url": known_url,
+    }).status_code == 201
+    fake = app.state.fake_codex
+    original_run = fake.run
+
+    def screen(prompt, *args, **kwargs):
+        candidates = json.loads(prompt.rsplit("RÉSULTATS WEB ET PAGES RÉCUPÉRÉES :\n", 1)[1])
+        fake.response = {"decisions": [
+            screening_decision(
+                item["candidate_id"], offer=None, decision="REJECT", reason_code="OUTSIDE_AI_SCOPE",
+            ) if item["url"] == rejected_url else screening_decision(
+                item["candidate_id"], offer=found_offer(item["url"]),
+            ) for item in candidates
+        ]}
+        return original_run(prompt, *args, **kwargs)
+
+    fake.run = screen
+    with httpx.Client(transport=httpx.MockTransport(search_handler)) as search_http:
+        app.state.search_provider_factory = lambda url: SearXNGProvider(url, search_http)
+        response = api.post("/codex/discover")
+    assert response.status_code == 200
+    discovered = response.json()
+    assert discovered["new"] == 100 and len(discovered["jobs"]) == 100
+    assert discovered["duplicates"] == discovered["rejected"] == 1
+    expected_urls = {offer["url"] for offer in offers}
+    assert {item["url"] for item in discovered["jobs"]} == expected_urls
+    applications = api.get("/applications").json()
+    assert len(applications) == 101
+    assert {item["url"] for item in applications} == expected_urls | {known_url}
+    assert all(item["status"] == "DETECTED" for item in applications)
+    latest = api.get("/codex/discovery/latest").json()
+    assert latest["search_call_count"] == len(search_requests) == 2
+    assert latest["raw_result_count"] == 210 and latest["admitted_result_count"] == 206
+    assert latest["intra_query_duplicate_count"] == 2 and latest["global_duplicate_count"] == 103
+    assert latest["known_url_count"] == latest["obvious_non_job_count"] == 1
+    assert latest["candidate_count"] == latest["ai_input_count"] == latest["ai_decision_count"] == 101
+    assert latest["candidate_limit_dropped"] == latest["ai_retry_count"] == 0
+    assert latest["ai_batch_count"] == fake.calls == 4
+    assert latest["ai_keep_count"] == latest["inserted_count"] == 100
+    assert latest["ai_reject_count"] == 1
+
+
 def test_discovery_eligibility_uses_fetched_content_and_blocks_selection(tmp_path):
     restricted = found_offer("https://jobs.example.test/restricted")
     civil = found_offer("https://jobs.example.test/civil")
@@ -1856,7 +1921,8 @@ def test_prepare_success_creates_complete_canonical_artifacts(tmp_path):
     assert result["cover_letter_word_count"] > 0
     assert "À compléter" not in (folder / "analysis.md").read_text(encoding="utf-8")
     copied = next((folder / "cv").glob("*.docx"))
-    assert sha256(cv) == source_hash == sha256(copied)
+    assert sha256(cv) == source_hash
+    assert document_text(copied) == document_text(cv)
     assert {path.name for path in cv.parent.glob("*.docx")} == variants_before
     assert result["cv_action"] == "REUSE"
     assert "## Resume decision" in (folder / "analysis.md").read_text(encoding="utf-8")
@@ -2012,6 +2078,34 @@ def test_prepare_codex_error_keeps_shortlisted(tmp_path):
     application_id = shortlist(api)
     assert api.post(f"/applications/{application_id}/prepare-with-codex").status_code == 200
     assert wait_for_preparation(api, application_id, "failed")["status"] == "SHORTLISTED"
+
+
+@pytest.mark.parametrize("action", ["REUSE", "ADAPT", "CREATE"])
+def test_future_preparation_uses_current_ats_renderer(tmp_path, monkeypatch, action):
+    from app import cv_documents, main
+    from docx import Document
+
+    repo = isolated_repo(tmp_path, with_variants=action != "CREATE")
+    originals = {path: path.read_bytes() for path in repo.rglob("*.docx")}
+    api, _ = client(tmp_path, preparation(action), repo_root=repo)
+    calls = []
+    renderer = cv_documents.convert_cv_to_ats
+    def current_renderer(source, destination, *args, **kwargs):
+        calls.append(destination)
+        return renderer(source, destination, *args, **kwargs)
+    monkeypatch.setattr(cv_documents, "convert_cv_to_ats", current_renderer)
+    monkeypatch.setattr(main, "convert_cv_to_ats", current_renderer)
+    application_id = shortlist(api)
+    assert api.post(f"/applications/{application_id}/prepare-with-codex").status_code == 200
+    result = wait_for_preparation(api, application_id, "completed")
+    generated = Path(result["cv_path"])
+    assert generated in calls
+    document = Document(generated)
+    assert not document.tables
+    assert document.styles["CV Name"].font.size.pt == 20.5
+    assert document.styles["CV Section"].font.color.rgb == (25, 53, 75)
+    assert api.get(f"/applications/{application_id}/cv").content == generated.read_bytes()
+    assert all(path.read_bytes() == content for path, content in originals.items())
 
 
 def test_prepare_adapt_creates_valid_offer_cv_without_changing_source(tmp_path):
@@ -2446,7 +2540,8 @@ def test_double_select_runs_one_preparation(tmp_path):
 
 
 @pytest.mark.parametrize("fail_a", [False, True])
-def test_preparation_queue_runs_two_jobs_fifo_and_releases_slot(tmp_path, fail_a):
+@pytest.mark.parametrize("batch", [False, True])
+def test_preparation_queue_runs_two_jobs_fifo_and_releases_slot(tmp_path, fail_a, batch):
     repo = isolated_repo(tmp_path, with_variants=True)
     fake = ControlledCodex(preparation(), fail={"A"} if fail_a else set())
     app = create_app(tmp_path / "tracker.db", tmp_path / "applications", FakeAuth(), lambda _: fake, repo_root=repo)
@@ -2458,15 +2553,26 @@ def test_preparation_queue_runs_two_jobs_fifo_and_releases_slot(tmp_path, fail_a
             "company": "Example", "position": name, "url": f"https://example.test/{name.lower()}",
         }).json()["id"]
 
-    assert api.post(f"/applications/{ids['A']}/select").json()["preparation_state"] == "running"
-    assert api.post(f"/applications/{ids['B']}/select").json()["preparation_state"] == "running"
-    assert api.post(f"/applications/{ids['C']}/select").json()["preparation_state"] == "queued"
+    assert api.put("/settings/generation", json={"max_concurrent_preparations": 2}).status_code == 200
+    if batch:
+        response = api.post("/applications/prepare-batch", json={"application_ids": list(ids.values())})
+        assert response.status_code == 200
+        assert response.json()["errors"] == []
+        assert [item["preparation_state"] for item in response.json()["applications"]] == ["running", "running", "queued"]
+    else:
+        assert api.post(f"/applications/{ids['A']}/select").json()["preparation_state"] == "running"
+        assert api.post(f"/applications/{ids['B']}/select").json()["preparation_state"] == "running"
+        assert api.post(f"/applications/{ids['C']}/select").json()["preparation_state"] == "queued"
     assert api.post(f"/applications/{ids['A']}/prepare-with-codex").status_code == 409
     assert api.post(f"/applications/{ids['C']}/prepare-with-codex").status_code == 409
     fake.wait_started("A")
     fake.wait_started("B")
     assert fake.max_active == 2
     assert api.get(f"/applications/{ids['C']}").json()["preparation_state"] == "queued"
+    if batch:
+        duplicate = api.post("/applications/prepare-batch", json={"application_ids": [ids["A"], ids["C"]]}).json()
+        assert duplicate["applications"] == []
+        assert [item["application_id"] for item in duplicate["errors"]] == [ids["A"], ids["C"]]
 
     fake.releases["A"].set()
     fake.wait_started("C")
@@ -2482,6 +2588,167 @@ def test_preparation_queue_runs_two_jobs_fifo_and_releases_slot(tmp_path, fail_a
     assert set(fake.started[:2]) == {"A", "B"} and fake.started[2] == "C"
     assert fake.max_active <= 2
     assert Path(prepared_b["cv_path"]).parent.parent != Path(prepared_c["cv_path"]).parent.parent
+
+
+@pytest.mark.parametrize("limit,count", [(0, 12), (1, 4), (2, 4)])
+def test_batch_size_is_independent_of_concurrency_limit(tmp_path, limit, count):
+    api, app = client(tmp_path, error=CodexError("Synthetic preparation failure"))
+    assert api.put("/settings/generation", json={"max_concurrent_preparations": limit}).status_code == 200
+    ids = [api.post("/applications", json={
+        "company": "Example", "position": f"Job {index}", "url": f"https://example.test/batch-{index}",
+    }).json()["id"] for index in range(count)]
+    response = api.post("/applications/prepare-batch", json={"application_ids": ids})
+    assert response.status_code == 200
+    assert len(response.json()["applications"]) == count
+    assert response.json()["errors"] == []
+    for application_id in ids:
+        assert "Synthetic preparation failure" in wait_for_preparation(api, application_id, "failed")["preparation_error"]
+    assert app.state.fake_codex.calls == count
+
+
+def wait_for_active_preparations(app, count, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with app.state.preparation_lock:
+            if app.state.active_preparations == count:
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"Expected {count} active preparations")
+
+
+@pytest.fixture
+def controlled_preparations(tmp_path):
+    repo = isolated_repo(tmp_path, with_variants=True)
+    fake = ControlledCodex(preparation())
+    app = create_app(tmp_path / "tracker.db", tmp_path / "applications", FakeAuth(), lambda _: fake, api_key_store=FakeKeyStore(), repo_root=repo)
+    api = TestClient(app)
+    assert api.put("/codex/model", json={"model": "test-model"}).status_code == 200
+    ids = {name: api.post("/applications", json={
+        "company": "Example", "position": name, "url": f"https://example.test/concurrency-{name}",
+    }).json()["id"] for name in ("A", "B", "C")}
+    unrelated = api.post("/applications", json={"company": "Other", "position": "Untouched", "url": "https://example.test/untouched"}).json()
+    unrelated = api.get(f"/applications/{unrelated['id']}").json()
+    try:
+        yield api, app, fake, ids
+        assert api.get(f"/applications/{unrelated['id']}").json() == unrelated
+    finally:
+        for release in fake.releases.values():
+            release.set()
+        wait_for_active_preparations(app, 0)
+        assert not app.state.preparation_jobs and not app.state.preparation_queue
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2])
+def test_preparation_concurrency_limit_and_duplicate_protection(controlled_preparations, limit):
+    api, app, fake, ids = controlled_preparations
+    assert api.put("/settings/generation", json={"max_concurrent_preparations": limit}).status_code == 200
+    response = api.post("/applications/prepare-batch", json={"application_ids": list(ids.values())})
+    assert response.status_code == 200 and len(response.json()["applications"]) == 3
+    assert response.json()["errors"] == []
+    simultaneous = limit or 3
+    for name in list(ids)[:simultaneous]:
+        fake.wait_started(name)
+    assert app.state.active_preparations == simultaneous
+    assert fake.max_active == simultaneous
+    assert len(app.state.preparation_queue) == 3 - simultaneous
+    duplicate = api.post("/applications/prepare-batch", json={"application_ids": list(ids.values())}).json()
+    assert duplicate["applications"] == [] and len(duplicate["errors"]) == 3
+    for name in ids:
+        fake.releases[name].set()
+        wait_for_preparation(api, ids[name], "completed")
+    wait_for_active_preparations(app, 0)
+    assert fake.calls == 3 and fake.max_active == simultaneous
+
+
+@pytest.mark.parametrize("new_limit", [2, 0])
+def test_increasing_concurrency_starts_pending_jobs_immediately(controlled_preparations, new_limit):
+    api, app, fake, ids = controlled_preparations
+    api.put("/settings/generation", json={"max_concurrent_preparations": 1})
+    api.post("/applications/prepare-batch", json={"application_ids": list(ids.values())})
+    fake.wait_started("A")
+    assert fake.started == ["A"]
+    response = api.put("/settings/generation", json={"max_concurrent_preparations": new_limit})
+    assert response.status_code == 200
+    fake.wait_started("B")
+    if new_limit == 0:
+        fake.wait_started("C")
+    assert app.state.active_preparations == (new_limit or 3)
+    assert not fake.releases["A"].is_set()
+
+
+@pytest.mark.parametrize("initial_limit", [0, 2])
+def test_decreasing_concurrency_waits_for_active_jobs_without_cancelling(controlled_preparations, initial_limit):
+    api, app, fake, ids = controlled_preparations
+    api.put("/settings/generation", json={"max_concurrent_preparations": initial_limit})
+    api.post("/applications/prepare-batch", json={"application_ids": [ids["A"], ids["B"]]})
+    fake.wait_started("A")
+    fake.wait_started("B")
+    api.put("/settings/generation", json={"max_concurrent_preparations": 1})
+    assert app.state.active_preparations == 2
+    assert api.post(f"/applications/{ids['C']}/select").json()["preparation_state"] == "queued"
+    fake.releases["A"].set()
+    wait_for_preparation(api, ids["A"], "completed")
+    wait_for_active_preparations(app, 1)
+    assert api.get(f"/applications/{ids['B']}").json()["preparation_state"] == "running"
+    assert api.get(f"/applications/{ids['C']}").json()["preparation_state"] == "queued"
+    assert set(fake.started) == {"A", "B"}
+    fake.releases["B"].set()
+    fake.wait_started("C")
+    assert app.state.active_preparations == 1
+
+
+def test_failed_preparation_releases_capacity_for_next_job(controlled_preparations):
+    api, app, fake, ids = controlled_preparations
+    fake.fail = {"A"}
+    api.put("/settings/generation", json={"max_concurrent_preparations": 1})
+    api.post("/applications/prepare-batch", json={"application_ids": list(ids.values())})
+    fake.wait_started("A")
+    fake.releases["A"].set()
+    assert "failure A" in wait_for_preparation(api, ids["A"], "failed")["preparation_error"]
+    fake.wait_started("B")
+    assert app.state.active_preparations == 1
+    assert api.get(f"/applications/{ids['C']}").json()["preparation_state"] == "queued"
+
+
+def test_batch_deduplicates_reports_individual_errors_and_retries_failed_offers(tmp_path):
+    repo = isolated_repo(tmp_path, with_variants=True)
+    api, app = client(tmp_path, preparation(), repo_root=repo, error=CodexError("Synthetic preparation failure"))
+    created = api.post("/applications", json={"company": "Example", "position": "Stage", "url": "https://example.test/batch"}).json()
+    application_id = created["id"]
+    api.put("/settings/generation", json={"max_concurrent_preparations": 1})
+    result = api.post("/applications/prepare-batch", json={"application_ids": [application_id, application_id]}).json()
+    assert len(result["applications"]) == 1 and result["errors"] == []
+    wait_for_preparation(api, application_id, "failed")
+    api.put("/settings/generation", json={"max_concurrent_preparations": 0})
+    app.state.fake_codex.error = None
+    result = api.post("/applications/prepare-batch", json={"application_ids": [99999, application_id]}).json()
+    assert [item["id"] for item in result["applications"]] == [application_id]
+    assert result["errors"] == [{"application_id": 99999, "detail": "Application not found"}]
+    prepared = wait_for_preparation(api, application_id, "completed")
+    assert Path(prepared["cv_path"]).is_file() and Path(prepared["cover_letter_path"]).is_file()
+    result = api.post("/applications/prepare-batch", json={"application_ids": [application_id]}).json()
+    assert result["applications"] == []
+    assert result["errors"][0]["application_id"] == application_id
+    assert app.state.fake_codex.calls == 2
+
+
+@pytest.mark.parametrize("ids", [[], [True], [1.5], ["1"], None])
+def test_batch_rejects_invalid_offer_ids(tmp_path, ids):
+    api, app = client(tmp_path)
+    assert api.post("/applications/prepare-batch", json={"application_ids": ids}).status_code == 422
+    assert app.state.fake_codex.calls == 0
+
+
+def test_batch_rejects_ineligible_offer_without_selecting_it(tmp_path):
+    api, app = client(tmp_path)
+    application_id = api.post("/applications", json={"company": "Example", "position": "Stage", "url": "https://example.test/ineligible-batch"}).json()["id"]
+    with connect(tmp_path / "tracker.db") as db:
+        db.execute("UPDATE applications SET eligibility_status='INELIGIBLE' WHERE id=?", (application_id,))
+        db.commit()
+    result = api.post("/applications/prepare-batch", json={"application_ids": [application_id]}).json()
+    assert result["applications"] == [] and len(result["errors"]) == 1
+    assert api.get(f"/applications/{application_id}").json()["status"] == "DETECTED"
+    assert app.state.fake_codex.calls == 0
 
 
 def test_backend_restart_marks_queued_preparation_interrupted(tmp_path, monkeypatch):

@@ -404,7 +404,7 @@ export default function App() {
     <main>
       {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}
       <Routes>
-        <Route path="/" element={stats && ai && searchProfile && searchConfig && pipelineConfig ? <Dashboard stats={stats} open={openDetail} auth={ai.chatgpt} ai={ai} models={models} model={model} effort={effort} last={lastDiscovery} profile={searchProfile} searchConfig={searchConfig} pipeline={pipelineConfig} searching={searching} connect={connectChatGPT} disconnect={disconnectChatGPT} refreshAI={refreshAI} saveProfile={saveSearchProfile} clearPrompt={clearSearchPrompt} activate={activate} chooseModel={chooseModel} chooseEffort={value => ai.active && void chooseAISettings(ai.active.provider_id, ai.active.auth_mode, model, value)} search={searchOffers} reportError={setError} /> : <p>Loading…</p>} />
+        <Route path="/" element={stats && ai && searchProfile && searchConfig && pipelineConfig ? <><header><h2>Dashboard</h2><p>Priority actions and pipeline status.</p></header><BatchDocumentGeneration applications={applications} preparing={preparing} refresh={refresh} canPrepare={!prepareDisabledReason} disabledReason={prepareDisabledReason} open={openDetail} /><Dashboard stats={stats} open={openDetail} auth={ai.chatgpt} ai={ai} models={models} model={model} effort={effort} last={lastDiscovery} profile={searchProfile} searchConfig={searchConfig} pipeline={pipelineConfig} searching={searching} connect={connectChatGPT} disconnect={disconnectChatGPT} refreshAI={refreshAI} saveProfile={saveSearchProfile} clearPrompt={clearSearchPrompt} activate={activate} chooseModel={chooseModel} chooseEffort={value => ai.active && void chooseAISettings(ai.active.provider_id, ai.active.auth_mode, model, value)} search={searchOffers} reportError={setError} /></> : <p>Loading…</p>} />
         <Route path="/applications" element={<ApplicationList applications={applications} open={openDetail} />} />
         <Route path="/kanban" element={<Kanban applications={applications} open={openDetail} openDocument={openDocument} preparing={preparing} prepare={prepareApplication} ignore={ignoreApplication} mutate={mutate} canPrepare={!prepareDisabledReason} prepareDisabledReason={prepareDisabledReason} />} />
         <Route path="/applications/new" element={<NewApplication done={async id => { await refresh(); openDetail(id); }} />} />
@@ -683,7 +683,7 @@ function Dashboard({ stats, open, auth, ai, models, model, effort, last, profile
     screening: "Job screening", deep_analysis: "Deep analysis",
     company_analysis: "Company analysis", application_preparation: "Application preparation",
   };
-  return <><header><h2>Dashboard</h2><p>Priority actions and pipeline status.</p></header>
+  return <>
     <section className="panel ai-provider">
       <details className="config-section" open><summary>AI provider</summary>
       <div className="config-switch" aria-label="Configuration method">
@@ -832,10 +832,90 @@ function Dashboard({ stats, open, auth, ai, models, model, effort, last, profile
     </section>
     <AiUsageCard refreshToken={stats} activity={searching || testingSearch} />
     <section className="cards">{cards.map(([label, value]) => <article key={String(label)}><strong>{value}</strong><span>{label}</span></article>)}</section>
-    <ActionList title="Due today" items={stats.today} open={open} />
     <ActionList title="Suggested follow-ups after 10 days" items={stats.followups} open={open} />
     <ActionList title="Upcoming interviews" items={stats.upcoming_interviews} open={open} />
   </>;
+}
+
+export function BatchDocumentGeneration({ applications, preparing, refresh, canPrepare, disabledReason = "", open }: {
+  applications: Application[]; preparing: Set<number>; refresh: () => Promise<void>; canPrepare: boolean;
+  disabledReason?: string; open: (id: number) => void;
+}) {
+  const [limit, setLimit] = useState<number | null>(null); const [input, setInput] = useState("0");
+  const [saving, setSaving] = useState(false); const [submitting, setSubmitting] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set()); const [submitted, setSubmitted] = useState<Set<number>>(new Set());
+  const [error, setError] = useState(""); const [message, setMessage] = useState("");
+  const [offerErrors, setOfferErrors] = useState<{ application_id: number; detail: string }[]>([]);
+  const submittingRef = useRef(false);
+  useEffect(() => {
+    let active = true;
+    request<{ max_concurrent_preparations: number }>("/settings/generation").then(saved => {
+      if (active) { setLimit(saved.max_concurrent_preparations); setInput(String(saved.max_concurrent_preparations)); }
+    }).catch(caught => { if (active) setError((caught as Error).message); });
+    return () => { active = false; };
+  }, []);
+  const validInput = /^\d+$/.test(input) && Number.isSafeInteger(Number(input));
+  const eligible = applications.filter(item => item.eligibility_status !== "INELIGIBLE" && !preparing.has(item.id)
+    && (item.status === "DETECTED" || (item.status === "SHORTLISTED" && item.preparation_state === "failed")));
+  const eligibleIds = new Set(eligible.map(item => item.id));
+  const selectedIds = eligible.filter(item => selected.has(item.id)).map(item => item.id);
+  const visible = applications.filter(item => eligibleIds.has(item.id) || item.status === "SHORTLISTED" || submitted.has(item.id));
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    if (!validInput || saving) return;
+    setSaving(true); setError(""); setMessage("");
+    try {
+      const saved = await request<{ max_concurrent_preparations: number }>("/settings/generation", {
+        method: "PUT", body: JSON.stringify({ max_concurrent_preparations: Number(input) }),
+      });
+      setLimit(saved.max_concurrent_preparations); setInput(String(saved.max_concurrent_preparations)); setMessage("Concurrency setting saved.");
+    } catch (caught) { setError((caught as Error).message); }
+    finally { setSaving(false); }
+  }
+
+  async function prepareBatch() {
+    if (submittingRef.current || !canPrepare || limit === null || !selectedIds.length || saving) return;
+    submittingRef.current = true; setSubmitting(true); setError(""); setMessage(""); setOfferErrors([]);
+    try {
+      const result = await request<{ applications: Application[]; errors: { application_id: number; detail: string }[] }>("/applications/prepare-batch", {
+        method: "POST", body: JSON.stringify({ application_ids: selectedIds }),
+      });
+      setSubmitted(new Set(result.applications.map(item => item.id))); setOfferErrors(result.errors);
+      setSelected(new Set(result.errors.map(item => item.application_id)));
+      setMessage(`Accepted for preparation: ${result.applications.length}. Rejected: ${result.errors.length}.`);
+      await refresh();
+    } catch (caught) { setError((caught as Error).message); }
+    finally { submittingRef.current = false; setSubmitting(false); }
+  }
+
+  return <section className="panel batch-generation" aria-label="Batch Document Generation">
+    <h3>Batch Document Generation</h3>
+    <form className="search-launch-settings" onSubmit={event => void save(event)} noValidate>
+      <label className="offer-age">Concurrent preparations<input type="number" min="0" step="1" value={input} disabled={limit === null || saving || submitting} aria-describedby="preparation-concurrency-help" aria-invalid={!validInput} onChange={event => { setInput(event.target.value); setMessage(""); }} /></label>
+      <span id="preparation-concurrency-help" className="muted">0 = Unlimited</span>
+      <button disabled={limit === null || !validInput || saving || submitting}>{saving ? "Saving…" : "Save"}</button>
+    </form>
+    {!validInput && <p className="error" role="alert">Concurrent preparations must be a non-negative integer.</p>}
+    <p className="muted">{limit === null ? "Loading concurrency setting…" : `Saved concurrency limit: ${limit === 0 ? "Unlimited" : limit}.`} This limits simultaneous preparations, not batch size. Additional offers wait in the queue.</p>
+    <p>Select offers below to prepare personalized resumes and cover letters together. Failed offers can be retried.</p>
+    {visible.length === 0 && <p>No offers available for preparation.</p>}
+    <div className="batch-offers">{visible.map(item => <div className="batch-offer" key={item.id}>
+      <label><input type="checkbox" aria-label={`Select ${item.company} — ${item.position}`} disabled={submitting || !canPrepare || !eligibleIds.has(item.id)} checked={selected.has(item.id) && eligibleIds.has(item.id)} onChange={event => setSelected(current => {
+        const next = new Set(current); if (event.target.checked) next.add(item.id); else next.delete(item.id); return next;
+      })} />{item.company} — {item.position}</label>
+      <button type="button" onClick={() => open(item.id)}>View offer</button>
+      <span>{preparing.has(item.id) ? "Submitting…" : item.preparation_state === "queued" ? "Queued for preparation" : item.preparation_state === "running" ? "Preparing with AI…" : item.preparation_state === "completed" ? "Preparation complete" : item.preparation_state === "failed" ? "Preparation failed" : item.status}</span>
+      {item.eligibility_status === "ELIGIBILITY_UNCERTAIN" && <EligibilityNotice status={item.eligibility_status} reason={item.eligibility_reason} />}
+      {item.preparation_error && <span className="failure-text">{item.preparation_error}</span>}
+    </div>)}</div>
+    <p>Selected offers: {selectedIds.length}.</p>
+    {!canPrepare && <p className="warning">{disabledReason}</p>}
+    <button className="primary" disabled={!canPrepare || limit === null || selectedIds.length === 0 || submitting || saving} onClick={() => void prepareBatch()}>{submitting ? "Submitting batch…" : "Prepare selected offers"}</button>
+    <div aria-live="polite">{message && <p className="success">{message}</p>}</div>
+    {error && <p className="error" role="alert">{error}</p>}
+    {offerErrors.map(item => <p className="error" role="alert" key={item.application_id}>Offer {item.application_id}: {item.detail}</p>)}
+  </section>;
 }
 
 function tokenCount(value: number | null | undefined) {
@@ -972,7 +1052,9 @@ export function Kanban({ applications, open, openDocument, preparing, prepare, i
   const columns = ["SEARCH", "REVIEW", "SUBMIT", "TRACK", "WITHDRAW"];
   const inColumn = (item: Application, column: string) => STATUS_GROUPS[column].includes(item.status);
   const run = (event: React.MouseEvent, action: () => void) => { event.stopPropagation(); action(); };
-  return <><header><h2>Kanban</h2><p>Search, review, submission, tracking and withdrawal.</p></header><div className="kanban">{columns.map(column => <section key={column}><h3>{column}</h3>{applications.filter(item => inColumn(item, column)).map(item => {
+  return <><header><h2>Kanban</h2><p>Search, review, submission, tracking and withdrawal.</p></header><div className="kanban">{columns.map(column => {
+    const columnApplications = applications.filter(item => inColumn(item, column));
+    return <section key={column}><h3>{column} ({columnApplications.length})</h3>{columnApplications.map(item => {
     const busy = preparing.has(item.id) || item.preparation_state === "running";
     const ineligible = item.eligibility_status === "INELIGIBLE";
     return <article className="ticket" key={item.id} onClick={() => open(item.id)}>
@@ -989,7 +1071,7 @@ export function Kanban({ applications, open, openDocument, preparing, prepare, i
         {["AWAITING_VALIDATION", "APPROVED", "SUBMITTING"].includes(item.status) && <><a className="button" href={item.url} target="_blank" rel="noopener noreferrer" onClick={event => event.stopPropagation()}>Open job</a><button className="primary" onClick={event => run(event, () => { if (window.confirm("Confirm that you have submitted this application?")) void mutate(`/applications/${item.id}/submission/confirm`); })}>Confirm submission</button></>}
       </div>
     </article>;
-  })}</section>)}</div></>;
+  })}</section>; })}</div></>;
 }
 
 function DiscardedOffers({ applications, restore }: { applications: Application[]; restore: (application: Application) => Promise<void> }) {
@@ -1159,7 +1241,7 @@ export function CvViewer({ application, back }: { application: Application; back
     <button className="primary" disabled={state === "loading" || state === "missing" || exporting} onClick={() => void exportPdf()}>{exporting ? "Export…" : "Exporter en PDF"}</button></header>
     {exportError && <p className="error">{exportError}</p>}
     {exportWarning && <p className="warning">{exportWarning}</p>}
-    <DocxPreview url={`${API}/applications/${application.id}/cv`} loadingLabel="Loading resume…" missingLabel="Resume not found." errorLabel="Unable to preview this resume." onStateChange={setState} />
+    <DocxPreview url={`${API}/applications/${application.id}/cv?v=${encodeURIComponent(application.updated_at)}&path=${encodeURIComponent(application.cv_path || "")}`} loadingLabel="Loading resume…" missingLabel="Resume not found." errorLabel="Unable to preview this resume." onStateChange={setState} />
   </>;
 }
 
@@ -1171,7 +1253,7 @@ export function DocxPreview({ url, loadingLabel, missingLabel, errorLabel, onSta
     let active = true;
     const update = (value: DocxState) => { if (active) { setState(value); onStateChange?.(value); } };
     update("loading");
-    fetch(url).then(async response => {
+    fetch(url, { cache: "no-store" }).then(async response => {
       if (response.status === 404) throw new Error("missing");
       if (!response.ok) throw new Error("fetch");
       const content = await response.arrayBuffer();

@@ -20,7 +20,7 @@ from app.cv_documents import (
     validate_cv_projects, validate_docx,
 )
 from app.main import add_event, connect
-from scripts import refresh_cvs
+from scripts import migrate_ats_cvs, refresh_cvs
 from test_codex_integration import (
     FakeApiProvider, FakeKeyStore, FakeProviderError, assert_no_source_leak, client, cv_content, isolated_repo,
     preparation, shortlist, wait_for_preparation,
@@ -47,42 +47,27 @@ def test_cv_layout_rebuilds_sections_and_preserves_relevant_skills(tmp_path, ski
     create_cv(first, second, content)
     assert document_text(first) == document_text(second)
     document = Document(second)
-    skills = document.tables[0].cell(0, 0).paragraphs
-    texts = [p.text for p in skills]
+    assert not document.tables
+    texts = [p.text for p in document.paragraphs]
     for group in content.skill_groups:
-        start = texts.index(group.title) + 1
-        retained = []
-        while texts[start].startswith("• "):
-            retained.append(texts[start][2:])
-            start += 1
-        assert 3 <= len(retained) <= skill_count
-        assert retained == group.items[:len(retained)]
-    if skill_count == 5:
-        assert sum(text.startswith("• Compétence") for text in texts) < 20
-    projects = document_text(second).split("PROJETS SÉLECTIONNÉS\n")[1].split("\nFORMATION")[0]
+        assert group.title + " : " + " · ".join(group.items) in texts
+    projects = document_text(second).split("PROJETS\n")[1].split("\nFORMATION")[0]
     assert projects.count("Projet technique documenté dans la Knowledge Base.") == len(content.projects)
     assert projects.count("• ") == len(content.projects) * bullet_count
-    with ZipFile(source) as original, ZipFile(second) as generated:
-        for name in original.namelist():
-            if name != "word/document.xml":
-                assert original.read(name) == generated.read(name)
-    assert [(node.tag, dict(node.attrib)) for node in document.sections[0]._sectPr.iter()] == [
-        (node.tag, dict(node.attrib)) for node in Document(source).sections[0]._sectPr.iter()
-    ]
-    original_texts = [p.text for p in Document(source).tables[0].cell(0, 0).paragraphs]
-    assert texts[texts.index("LANGUES"):] == original_texts[original_texts.index("LANGUES"):]
+    assert document.sections[0].page_width.cm == pytest.approx(21, abs=.01)
+    assert texts.index("PROFIL") < texts.index("COMPÉTENCES") < texts.index("PROJETS") < texts.index("FORMATION") < texts.index("LANGUES")
+    assert "English" in texts and "Reading" in texts
 
 
-def test_oversized_cv_keeps_existing_destination(tmp_path):
+def test_oversized_cv_preserves_content_instead_of_forcing_one_page(tmp_path):
     repo = isolated_repo(tmp_path)
     source = repo / "01_Career/CV/Templates/resume-template.docx"
     content = cv_content()
     content["projects"][0]["description"] = "Description trop longue. " * 2000
     destination = tmp_path / "existing.docx"
     destination.write_bytes(b"original")
-    with pytest.raises(CvDocumentError, match="Resume too long"):
-        create_cv(source, destination, CvContent.model_validate(content), replace=True)
-    assert destination.read_bytes() == b"original"
+    create_cv(source, destination, CvContent.model_validate(content), replace=True)
+    assert content["projects"][0]["description"].strip() in document_text(destination)
 
 
 def test_old_cv_requires_adaptation_before_reuse(tmp_path):
@@ -92,6 +77,131 @@ def test_old_cv_requires_adaptation_before_reuse(tmp_path):
     validate_cv_layout(repo / "01_Career/CV/Generated/resume_A.docx")
     with pytest.raises(CvDocumentError, match="choose ADAPT"):
         validate_cv_layout(repo / "01_Career/CV/Templates/resume-template.docx")
+
+
+@pytest.mark.parametrize("sent_evidence", ["sent_at", "SENT", "ACKNOWLEDGED"])
+def test_ats_migration_protects_send_history_after_status_reset(prepared_application, tmp_path, sent_evidence):
+    _, app, application_id, source = prepared_application
+    set_fields(app, application_id, status="PREPARED")
+    if sent_evidence == "sent_at":
+        set_fields(app, application_id, sent_at="2026-10-01T12:00:00Z")
+    else:
+        with connect(app.state.db_path) as db:
+            add_event(db, application_id, sent_evidence, "Historical submission")
+            db.commit()
+    before = source.read_bytes(), application_row(app, application_id), events(app, application_id)
+    report = migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root,
+                                       tmp_path / "ats", apply_changes=True)
+    assert report[0]["reason"] == "sent-history-protected"
+    assert before == (source.read_bytes(), application_row(app, application_id), events(app, application_id))
+
+
+def test_ats_migration_resets_approval_and_invalidates_pdf(prepared_application, tmp_path):
+    _, app, application_id, source = prepared_application
+    set_fields(app, application_id, status="APPROVED")
+    pdf = source.with_suffix(".pdf")
+    pdf.write_bytes(b"stale PDF")
+    before = source.read_bytes()
+    history = events(app, application_id)
+    folder = tmp_path / "ats"
+    migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root, folder)
+    report = migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root,
+                                       folder, apply_changes=True)
+    assert report[0]["action"] == "converted"
+    assert application_row(app, application_id)["status"] == "AWAITING_VALIDATION"
+    assert application_row(app, application_id)["cv_path"] == str(source)
+    assert events(app, application_id)[:-1] == history
+    assert not pdf.exists()
+    assert (folder / f"application-{application_id}.original.docx").read_bytes() == before
+    assert (folder / f"application-{application_id}.original.pdf").read_bytes() == b"stale PDF"
+    assert not (folder / f"application-{application_id}.docx").exists()
+    assert json.loads((folder / "report.json").read_text("utf-8")) == report
+
+
+def test_ats_migration_rejects_changes_after_review(prepared_application, tmp_path):
+    _, app, application_id, source = prepared_application
+    folder = tmp_path / "ats"
+    migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root, folder)
+    original = source.read_bytes()
+    candidate = folder / f"application-{application_id}.docx"
+    candidate.write_bytes(candidate.read_bytes() + b"changed since review")
+    with pytest.raises(ValueError, match="changed since staging"):
+        migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root,
+                                    folder, apply_changes=True)
+    assert source.read_bytes() == original
+    assert candidate.read_bytes().endswith(b"changed since review")
+    assert (folder / "report.json").is_file()
+
+
+def test_ats_migration_refuses_missing_database(tmp_path):
+    database = tmp_path / "missing.db"
+    with pytest.raises(ValueError, match="refusing to create"):
+        migrate_ats_cvs.ats_migration(database, tmp_path, tmp_path, tmp_path / "ats")
+    assert not database.exists()
+
+
+def test_ats_migration_cli_defaults_outside_repo_and_requires_reviewed_directory(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(migrate_ats_cvs, "ats_migration", lambda *args: calls.append(args) or [])
+    arguments = ["migrate_ats_cvs", "--database", "existing.db", "--knowledge-base", "kb",
+                 "--applications-root", "applications"]
+    monkeypatch.setattr(sys, "argv", arguments)
+    migrate_ats_cvs.main()
+    assert calls[0][3].parent == tmp_path / "ai-job-application-workbench" / "ats-migrations"
+    monkeypatch.setattr(sys, "argv", arguments + ["--apply"])
+    with pytest.raises(SystemExit) as error:
+        migrate_ats_cvs.main()
+    assert error.value.code == 2
+    assert len(calls) == 1
+
+
+def test_ats_legacy_project_sentences_keep_description_and_bullets(tmp_path):
+    from docx import Document
+    from app.cv_documents import convert_cv_to_ats
+    repo = isolated_repo(tmp_path)
+    source = repo / "01_Career/CV/Templates/resume-template.docx"
+    document = Document(source)
+    projects = document.tables[0].cell(0, 1).paragraphs
+    projects[3].text = "Existing achievement without a literal bullet."
+    document.save(source)
+    output = tmp_path / "legacy-ats.docx"
+    convert_cv_to_ats(source, output)
+    paragraphs = Document(output).paragraphs
+    description = next(p for p in paragraphs if p.text == "Documented implementation.")
+    assert description.style.name == "CV Project Desc"
+    assert document_text(output).count("• Existing achievement without a literal bullet.") == 1
+
+
+def test_ats_links_are_clickable_and_only_in_header(tmp_path):
+    from docx import Document
+    from app.cv_documents import convert_cv_to_ats
+    repo = isolated_repo(tmp_path)
+    source = repo / "01_Career/CV/Templates/resume-template.docx"
+    document = Document(source)
+    document.add_paragraph("Extra contact")  # Existing content remains in its section.
+    document.paragraphs[1].text = "Candidate degree"
+    document.add_paragraph(" ")
+    # Legacy header has three identity paragraphs. Add the reference contact line before the table.
+    contact = document.add_paragraph("City · candidate@example.test · linkedin.com/in/example · github.com/example · example.github.io")
+    document.paragraphs[2]._p.addnext(contact._p)
+    links = document.tables[0].cell(0, 0)
+    for text in ("Portfolioexample.github.io", "GitHubgithub.com/example", "LinkedInlinkedin.com/in/example"):
+        links.add_paragraph(text)
+    document.save(source)
+    output = tmp_path / "ats.docx"
+    convert_cv_to_ats(source, output)
+    document = Document(output)
+    assert not document.tables
+    with ZipFile(output) as archive:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(archive.read("word/document.xml"))
+        w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        paragraphs = list(root.iter(w + "p"))
+        assert len(list(paragraphs[3].iter(w + "hyperlink"))) == 5  # Email, three profile links and legacy website.
+        assert not any(list(p.iter(w + "hyperlink")) for p in paragraphs[4:])
+    assert document_text(output).count("github.com/example") == 1
+    assert document_text(output).count("example.github.io") == 1
 
 
 @pytest.fixture
@@ -218,9 +328,9 @@ def test_reuse_copies_three_projects_with_two_bullets_each(prepared_application)
     _, app, _, source = prepared_application
     variant = cv_variants(app.state.repo_root)["A"]["path"]
     assert source != variant
-    assert source.read_bytes() == variant.read_bytes()
+    assert document_text(source) == document_text(variant)
     lines = document_text(source).splitlines()
-    section = lines[lines.index("PROJETS SÉLECTIONNÉS") + 1:lines.index("FORMATION")]
+    section = lines[lines.index("PROJETS") + 1:lines.index("FORMATION")]
     assert sum(line.startswith("• ") for line in section) == 6
 
 
@@ -369,7 +479,7 @@ def test_cv_refresh_preserves_entire_application_row_and_other_artifacts(prepare
     assert cv_project_order(source, project_catalog(app.state.repo_root)) == target["project_order"]
     text = document_text(source)
     assert_no_source_leak(text)
-    projects = text.split("PROJETS SÉLECTIONNÉS\n", 1)[1].split("\nFORMATION", 1)[0]
+    projects = text.split("PROJETS\n", 1)[1].split("\nFORMATION", 1)[0]
     assert sum(line.startswith("• ") for line in projects.splitlines()) == 2 * len(target["project_order"])
     after_events = events(app, application_id)
     assert after_events[:-1] == before_events
@@ -597,7 +707,7 @@ def test_english_resume_headings_support_four_grounded_projects(tmp_path):
     output = tmp_path / "english.docx"
     create_cv(source, output, CvContent.model_validate(cv_content(PROJECT_IDS[:4])))
     validate_cv_layout(output)
-    assert "SELECTED PROJECTS" in document_text(output)
+    assert "PROJETS" in document_text(output)
     assert cv_project_order(output, project_catalog(repo)) == PROJECT_IDS[:4]
 
 
@@ -618,3 +728,87 @@ def test_unique_user_named_resume_template_works_without_code_changes(tmp_path):
     assert cv_project_order(Path(result["cv_path"]), project_catalog(repo)) == PROJECT_IDS[:4]
     preferred.write_bytes(template.read_bytes())
     assert cv_template_path(repo) == preferred
+
+
+def test_reference_design_roundtrip_preserves_text_links_and_styles(tmp_path):
+    from docx import Document
+    from app.cv_documents import convert_cv_to_ats, validate_cv_preservation
+    repo = isolated_repo(tmp_path)
+    source = repo / "01_Career/CV/Templates/resume-template.docx"
+    first, second = tmp_path / "first.docx", tmp_path / "second.docx"
+    create_cv(source, first, CvContent.model_validate(cv_content()))
+    convert_cv_to_ats(first, second)
+    validate_cv_preservation(first, second)
+    assert document_text(first) == document_text(second)
+    document = Document(second)
+    assert document.styles["CV Section"].font.color.rgb == (25, 53, 75)
+    assert document.styles["CV Body"].font.size.pt == 9
+    assert document.styles["CV Bullet"].font.size.pt == 8.5
+    assert len([p for p in document.paragraphs if p.style.name == "CV Project Tech"]) == 3
+    assert all(p._p.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr/{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pBdr") is not None
+               for p in document.paragraphs if p.style.name == "CV Section")
+
+
+def test_preservation_rejects_changed_punctuation_and_hyperlink_target(tmp_path):
+    from docx import Document
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from app.cv_documents import convert_cv_to_ats, validate_cv_preservation
+    repo = isolated_repo(tmp_path)
+    source = repo / "01_Career/CV/Templates/resume-template.docx"
+    first, second = tmp_path / "first.docx", tmp_path / "second.docx"
+    content = cv_content()
+    content["profile"] += " C++."
+    create_cv(source, first, CvContent.model_validate(content))
+    convert_cv_to_ats(first, second)
+    document = Document(second)
+    paragraph = next(p for p in document.paragraphs if "C++" in p.text)
+    paragraph.text = paragraph.text.replace("C++", "C#")
+    document.save(second)
+    with pytest.raises(CvDocumentError, match="content changed"):
+        validate_cv_preservation(first, second)
+    convert_cv_to_ats(first, second, replace=True)
+    document = Document(second)
+    relation = next(r for r in document.part.rels.values() if r.reltype == RT.HYPERLINK)
+    relation._target = "https://changed.example.test"
+    document.save(second)
+    with pytest.raises(CvDocumentError, match="hyperlink targets"):
+        validate_cv_preservation(first, second)
+
+
+def test_ats_migration_excludes_ambiguous_submission_history(prepared_application, tmp_path):
+    _, app, application_id, source = prepared_application
+    with connect(app.state.db_path) as db:
+        add_event(db, application_id, "SUBMISSION_STARTED", "No delivery confirmation")
+        db.commit()
+    original = source.read_bytes(), application_row(app, application_id)
+    report = migrate_ats_cvs.ats_migration(app.state.db_path, app.state.repo_root, app.state.applications_root,
+                                         tmp_path / "ambiguous", apply_changes=True)
+    assert report[0]["reason"] == "submission-started-send-status-ambiguous"
+    assert original == (source.read_bytes(), application_row(app, application_id))
+
+
+def test_named_body_and_footer_hyperlinks_remain_visible(tmp_path):
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from app.cv_documents import convert_cv_to_ats, document_hyperlinks, validate_cv_preservation
+    repo = isolated_repo(tmp_path)
+    first, second = tmp_path / "first.docx", tmp_path / "second.docx"
+    create_cv(repo / "01_Career/CV/Templates/resume-template.docx", first, CvContent.model_validate(cv_content()))
+    document = Document(first)
+    body = next(p for p in document.paragraphs if p.style.name == "CV Project Desc")
+    for paragraph, label, url in [(body, "Project repository", "https://example.test/project"),
+                                   (document.sections[0].footer.paragraphs[0], "Portfolio", "https://example.test/portfolio")]:
+        paragraph.add_run(" ")
+        link = OxmlElement("w:hyperlink")
+        link.set(qn("r:id"), paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True))
+        run, text = OxmlElement("w:r"), OxmlElement("w:t")
+        text.text = label; run.append(text); link.append(run); paragraph._p.append(link)
+    document.save(first)
+    convert_cv_to_ats(first, second)
+    validate_cv_preservation(first, second)
+    assert document_hyperlinks(second)["Project repository"] == "https://example.test/project"
+    assert "https://example.test/portfolio" in document_hyperlinks(second).values()
+    assert document_text(second).count("Project repository") == 1
+    assert document_text(second).count("https://example.test/project") == 0

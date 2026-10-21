@@ -90,7 +90,29 @@ python backend/scripts/refresh_cvs.py --apply data/cv-review
 
 Les scripts utilisent les variables d'environnement exportées ou la configuration du dashboard ; ils ne chargent pas `.env` eux-mêmes. Passez `--knowledge-base` et `--database` si nécessaire. Le refresh de candidature conserve les projets existants et leur ordre, puis peut ajouter des projets pertinents documentés pour atteindre quatre. Statut, offre, historique, métadonnées de décision, variante originale et autres documents restent intacts. Le refresh des variantes globales (`--include-variants`) conserve exactement l'ensemble et l'ordre du manifeste. Toute modification des fichiers ou de la candidature invalide le plan relu. Le script de nettoyage commence en dry-run ; examinez son `--help` et son rapport avant toute modification. Le script historique de migration des lettres écrit dès son invocation et exige la configuration KB/base exportée.
 
+Pour convertir uniquement la mise en page, sans appel IA ni réécriture du contenu, utilisez le script dédié avec une base existante explicitement vérifiée :
+
+```sh
+python backend/scripts/migrate_ats_cvs.py --database <base-existante> --knowledge-base <kb> --applications-root <candidatures> --directory <dossier-de-revue> --include-variants
+```
+
+Relisez les fichiers préparés. Réexécutez avec le même dossier validé et `--apply` pour convertir les CV non envoyés, les templates et variantes. Les historiques d'envoi protègent les documents ; les envois commencés sont considérés ambigus. Les CV approuvés convertis repassent en validation humaine. Le dossier conserve les originaux et le rapport ; les PDF périmés sont invalidés puis régénérés à l'export. Aucun schéma SQLite n'est initialisé par ce script.
+
+Sans `--directory`, le script utilise un dossier daté durable hors du dépôt : `%LOCALAPPDATA%/ai-job-application-workbench/ats-migrations/` sous Windows, `~/.local/share/ai-job-application-workbench/ats-migrations/` sinon. Le chemin est affiché au lancement ; `--apply` exige explicitement ce même dossier relu. Après réussite complète, seuls les DOCX intermédiaires sont supprimés ; les originaux et `report.json` restent conservés. En cas d’échec, les documents intermédiaires et diagnostics restent disponibles. Conservez aussi la sauvegarde SQLite et les rapports de validation avant tout nettoyage.
+
 L'application inclut des viewers Markdown et DOCX avec navigation intégrée. La conversion PDF essaie Microsoft Word sous Windows, puis LibreOffice. Installez séparément un convertisseur si nécessaire ; son absence produit une erreur explicite. Relisez pagination et contenu avant utilisation.
+
+## Préparation de documents par lot et concurrence
+
+Le dashboard commence par **Batch Document Generation**, puis présente les réglages des providers, le profil de recherche, la consommation de tokens, les compteurs du pipeline, les relances suggérées et les prochains entretiens.
+
+Dans **Batch Document Generation** sur le dashboard, réglez **Concurrent preparations**, puis cliquez sur **Save**. La valeur par défaut **0 = Unlimited** supprime toute limite applicative de concurrence. Une valeur entière positive limite le nombre de préparations simultanées ; les suivantes attendent dans la file FIFO existante. Le nombre total d'offres sélectionnées dans un lot reste illimité. Les nombres négatifs, décimaux et les valeurs invalides sont refusés.
+
+Le réglage s'applique aux préparations individuelles comme aux lots, sans plafond fixe à deux. Une diminution laisse finir les préparations actives et attend une capacité disponible avant de démarrer les suivantes. Une augmentation ou le passage à 0 démarre immédiatement les préparations en attente selon la capacité disponible. Avec 0, toutes peuvent démarrer simultanément, sous réserve des limites du provider et du système. Une réussite ou un échec libère une place.
+
+Sélectionnez les offres avec les cases à cocher, puis cliquez sur **Prepare selected offers**. Les offres détectées et les préparations échouées sont sélectionnables ; les offres inéligibles sont exclues. Les doublons et les offres déjà en attente, en cours ou traitées sont protégés contre une nouvelle génération. Les états et erreurs restent individuels. La personnalisation, les timeouts et les retries existants sont conservés. Relisez les documents et soumettez toujours manuellement.
+
+Le réglage conserve sa valeur dans la même entrée de la table SQLite `settings`, après rechargement ou redémarrage, et s'applique sans redémarrer le backend. Aucun changement d'installation n'est nécessaire. L'API utilise `GET /settings/generation`, `PUT /settings/generation` avec `{"max_concurrent_preparations": 0}`, et `POST /applications/prepare-batch` avec `{"application_ids": [1, 2, 3]}`. Le champ `max_concurrent_preparations` remplace l'ancien champ de taille de lot. La réponse contient les `applications` acceptées et leurs `errors` éventuelles ; acceptée ne signifie pas terminée. Les réglages invalides et les lots vides renvoient HTTP 422. Après un redémarrage, les préparations interrompues restent à relancer manuellement ; le réglage est conservé.
 
 ## Consommation de tokens
 

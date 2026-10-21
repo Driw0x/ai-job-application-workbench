@@ -64,10 +64,10 @@ class SearXNGProvider:
     def test(self) -> None:
         self._request("test", 1)
 
-    def search(self, query: str, limit: int = 20) -> list[SearchResult]:
+    def search(self, query: str, limit: int | None = None) -> list[SearchResult]:
         return self._request(query, limit)
 
-    def _request(self, query: str, limit: int) -> list[SearchResult]:
+    def _request(self, query: str, limit: int | None) -> list[SearchResult]:
         self.last_stats = {
             "raw_result_count": None, "extracted_url_count": None,
             "admitted_result_count": None, "intra_query_duplicate_count": None,
@@ -106,7 +106,7 @@ class SearXNGProvider:
                 duplicate_count += 1
                 continue
             seen.add(url)
-            if len(results) < limit:
+            if limit is None or len(results) < limit:
                 results.append(SearchResult(
                     title=str(item.get("title") or url),
                     url=url,
@@ -148,7 +148,7 @@ class AIWebSearchProvider:
     def test(self) -> None:
         self.search("test", 1)
 
-    def search(self, query: str, limit: int = 20) -> list[SearchResult]:
+    def search(self, query: str, limit: int | None = None) -> list[SearchResult]:
         self.last_stats = {
             "raw_result_count": None, "extracted_url_count": None,
             "admitted_result_count": None, "intra_query_duplicate_count": None,
@@ -171,7 +171,9 @@ class AIWebSearchProvider:
         }
         prompt = (
             f"Effectue une recherche Web actuelle pour cette requête : {query!r}. "
-            f"Retourne au maximum {limit} offres réellement trouvées. Chaque résultat doit contenir "
+            + (f"Retourne au maximum {limit} offres réellement trouvées. " if limit is not None
+               else "Retourne toutes les offres réellement trouvées. ")
+            + "Chaque résultat doit contenir "
             "un titre, une entreprise si disponible, une URL source vérifiable, un résumé factuel et la source. "
             "N'invente aucune offre ni URL. Omet tout résultat sans URL Web exploitable. Ne décide pas de son éligibilité."
         )
@@ -203,7 +205,7 @@ class AIWebSearchProvider:
                     company=str(item.get("company") or ""), retrieval_mode="AI_DIRECT",
                     search_provider=self.provider_name,
                 ))
-            admitted = results[:limit]
+            admitted = results if limit is None else results[:limit]
             self.last_stats.update({
                 "raw_result_count": len(data.get("results", [])),
                 "extracted_url_count": len(data.get("results", [])) - invalid_count,

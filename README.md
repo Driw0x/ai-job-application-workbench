@@ -92,6 +92,18 @@ CLI scripts use exported environment variables or the saved dashboard configurat
 
 The application includes Markdown and DOCX viewers with integrated navigation. PDF conversion tries Microsoft Word on Windows, then LibreOffice. Install an available converter separately if you need PDF; absence produces an explicit error. Review pagination and content before using any document.
 
+## Batch document generation
+
+The dashboard starts with **Batch Document Generation**, followed by provider settings, the search profile, token usage, pipeline counts, suggested follow-ups and upcoming interviews.
+
+On the main dashboard, open **Batch Document Generation**. Set **Concurrent preparations** and click **Save**. The default is **0 = Unlimited**: there is no application-level concurrency limit. A positive integer allows at most that many simultaneous preparations; additional offers wait in the existing FIFO queue. This setting never limits how many offers you can select in one batch. Negative numbers, decimal values and invalid inputs are rejected. The saved value applies immediately and persists in the existing SQLite `settings` table across reloads and backend restarts. Previously saved values are retained, using the same storage key. No installation or environment changes are required.
+
+Select the checkboxes beside available offers, then click **Prepare selected offers**. Detected offers and failed preparations are selectable; failed offers reuse the existing retry workflow. Ineligible offers cannot be selected. Batches of any size are accepted regardless of the concurrency setting. Repeated IDs count once; offers already queued, running or processed are reported individually without generating duplicate documents.
+
+The concurrency setting applies to both individual and batch preparations; there is no fixed two-job ceiling. Lowering the limit lets active preparations finish, then starts waiting offers only when capacity becomes available. Raising the limit or setting it to 0 immediately starts waiting offers up to the available capacity. With 0, all waiting offers may start concurrently; provider and system limits still apply. Success or failure releases capacity for the next offer. Personalization, provider timeouts, retries and error handling remain unchanged. The dashboard shows each offer's queued, running, completed or failed state. Review generated documents and submit applications manually as usual.
+
+The API exposes `GET /settings/generation`, `PUT /settings/generation` with `{"max_concurrent_preparations": 0}`, and `POST /applications/prepare-batch` with `{"application_ids": [1, 2, 3]}`. The generation API uses `max_concurrent_preparations` instead of the former batch-size field. Batch responses contain accepted `applications` and per-offer `errors`; acceptance means queued or started, not completed. Invalid settings and empty batches return HTTP 422. If the backend restarts during preparation, the existing recovery behavior marks interrupted jobs as failed for manual retry; the saved concurrency setting remains intact.
+
 ## Token usage
 
 Numbers/Charts views show search versus document-generation totals and date charts. The ledger records provider/model/stage metadata; discovery also exposes observed Web-search metadata. Unknown usage remains unavailable; observed zero remains zero. Date filters use UTC. No invented prices, external analytics service or telemetry is added. Provider requests transmit the context explicitly required by the selected workflow.

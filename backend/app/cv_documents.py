@@ -1,23 +1,20 @@
 from __future__ import annotations
 
-import copy
-import io
-import logging
 import re
 import tempfile
 import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
+from zipfile import BadZipFile, ZipFile
 
 from docx import Document
 
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-logger = logging.getLogger(__name__)
 CV_HEADINGS = {
     "PROFILE": "PROFIL", "SKILLS": "COMPÉTENCES", "LANGUAGES": "LANGUES",
-    "SELECTED PROJECTS": "PROJETS SÉLECTIONNÉS", "EDUCATION": "FORMATION",
+    "SELECTED PROJECTS": "PROJETS", "PROJETS SÉLECTIONNÉS": "PROJETS", "PROJECTS": "PROJETS",
+    "EDUCATION": "FORMATION", "EXPERIENCE": "EXPÉRIENCES", "INTERESTS": "CENTRES D'INTÉRÊT", "LINKS": "LIENS",
 }
 
 
@@ -99,13 +96,6 @@ def register_variant(repo: Path, variant: str, project_order: list[str], catalog
     manifest.write_text(current.rstrip() + "\n" + entry, encoding="utf-8")
 
 
-def _parse_xml(xml: bytes) -> ET.Element:
-    for _, (prefix, uri) in ET.iterparse(io.BytesIO(xml), events=("start-ns",)):
-        if not prefix.startswith("ns"):
-            ET.register_namespace(prefix, uri)
-    return ET.fromstring(xml)
-
-
 def document_text(path: Path) -> str:
     try:
         with ZipFile(path) as archive:
@@ -127,35 +117,28 @@ def validate_docx(path: Path) -> None:
         raise CvDocumentError("Generated resume is empty")
 
 
+ATS_SECTIONS = ("PROFIL", "COMPÉTENCES", "PROJETS", "FORMATION", "EXPÉRIENCES", "LANGUES", "CENTRES D'INTÉRÊT")
+
+
 def validate_cv_layout(path: Path) -> None:
-    """Prevent REUSE from bypassing the current content layout."""
-    lines = [CV_HEADINGS.get(line, line) for line in document_text(path).splitlines()]
+    document = Document(path)
+    lines = document_text(path).splitlines()
     try:
-        skills = lines[lines.index("COMPÉTENCES") + 1:lines.index("LANGUES")]
-        projects = lines[lines.index("PROJETS SÉLECTIONNÉS") + 1:lines.index("FORMATION")]
-        counts = []
-        for line in skills:
-            if line.startswith("• "):
-                counts[-1] += 1
-            else:
-                counts.append(0)
-        if len(counts) != 4 or any(count < 3 or count > 5 for count in counts):
+        positions = [lines.index(title) for title in ATS_SECTIONS if title in lines]
+        if not all(title in lines for title in ("PROFIL", "COMPÉTENCES", "PROJETS", "FORMATION", "LANGUES")):
             raise ValueError
-        cursor = 0
-        while cursor < len(projects):
-            if projects[cursor].startswith("• ") or projects[cursor + 1].startswith("• "):
-                raise ValueError
-            cursor += 2  # Title followed by a distinct general description.
-            bullets = 0
-            while cursor < len(projects) and projects[cursor].startswith("• "):
-                bullets += 1
-                cursor += 1
-            if bullets not in {2, 3}:
-                raise ValueError
-        if not projects:
+        if positions != sorted(positions) or document.tables:
             raise ValueError
-    except (ValueError, IndexError) as error:
-        raise CvDocumentError("Legacy or incompatible resume layout: choose ADAPT with descriptions and 3 to 5 skills per group") from error
+        if any(document._element.iter(W + "txbxContent")):
+            raise ValueError
+        for section in document.sections:
+            cols = section._sectPr.find(W + "cols")
+            if cols is not None and cols.get(W + "num", "1") != "1":
+                raise ValueError
+            if abs(section.page_width.cm - 21) > .02 or abs(section.page_height.cm - 29.7) > .02:
+                raise ValueError
+    except ValueError as error:
+        raise CvDocumentError("Legacy or incompatible resume layout: choose ADAPT for ATS layout") from error
 
 
 def validate_cv_projects(
@@ -164,9 +147,9 @@ def validate_cv_projects(
     lines = [CV_HEADINGS.get(line, line) for line in document_text(path).splitlines()]
     normalized = [canonical_project_id(line) for line in lines]
     try:
-        start = normalized.index("projets-selectionnes") + 1
+        start = next(index for index, title in enumerate(normalized) if title in {"projets", "projets-selectionnes"}) + 1
         end = normalized.index("formation", start)
-    except ValueError as error:
+    except (ValueError, StopIteration) as error:
         raise CvDocumentError("Resume projects section not found") from error
     section = normalized_project_text("\n".join(lines[start:end]))
     titles = {**catalog, **(rendered_titles or {})}
@@ -179,9 +162,9 @@ def cv_project_order(path: Path, catalog: dict[str, str]) -> list[str]:
     lines = [CV_HEADINGS.get(line, line) for line in document_text(path).splitlines()]
     normalized = [canonical_project_id(line) for line in lines]
     try:
-        start = normalized.index("projets-selectionnes") + 1
+        start = next(index for index, title in enumerate(normalized) if title in {"projets", "projets-selectionnes"}) + 1
         end = normalized.index("formation", start)
-    except ValueError as error:
+    except (ValueError, StopIteration) as error:
         raise CvDocumentError("Resume projects section not found") from error
     order = []
     for line in lines[start:end]:
@@ -195,197 +178,268 @@ def cv_project_order(path: Path, catalog: dict[str, str]) -> list[str]:
     return order
 
 
-def _set_text(paragraph: ET.Element, values: list[str]) -> None:
-    nodes = list(paragraph.iter(W + "t"))
-    if len(nodes) < len(values):
-        raise CvDocumentError("Incompatible resume template structure")
-    for node, value in zip(nodes, values):
-        node.text = value
-    for node in nodes[len(values):]:
-        node.text = ""
+def _cv_sections(source: Path) -> tuple[list[str], dict[str, list[str]]]:
+    """Read legacy table cells and ATS paragraphs in their existing section order."""
+    header, sections = [], {}
+    current = header
+    lines = document_text(source).splitlines()
+    # Our visual model separates technologies; restore the semantic title for rendering.
+    paragraphs = Document(source).paragraphs
+    if any(p.style.name == "CV Project Tech" for p in paragraphs):
+        lines = []
+        for p in paragraphs:
+            if not p.text.strip():
+                continue
+            if p.style.name == "CV Project Tech" and lines:
+                lines[-1] += "  |  " + p.text.strip()
+            else:
+                lines.append(p.text.strip())
+    for text in lines:
+        heading = CV_HEADINGS.get(text, text)
+        if heading in (*ATS_SECTIONS, "LIENS"):
+            if heading in sections:
+                raise CvDocumentError(f"Duplicate resume section: {heading}")
+            current = sections.setdefault(heading, [])
+        else:
+            current.append(text)
+    for required in ("PROFIL", "COMPÉTENCES", "PROJETS", "FORMATION", "LANGUES"):
+        if required not in sections:
+            raise CvDocumentError(f"Section '{required}' missing from resume template")
+    return header, sections
 
 
-def _paragraph_text(paragraph: ET.Element) -> str:
-    return "".join(node.text or "" for node in paragraph.iter(W + "t")).strip()
+def _compact_skills(lines: list[str]) -> list[str]:
+    compact = []
+    for text in lines:
+        if text.startswith("• ") and compact:
+            compact[-1] += (" : " if " : " not in compact[-1] else " · ") + text[2:]
+        else:
+            compact.append(text)
+    return compact
 
 
-def _find(paragraphs: list[ET.Element], text: str) -> int:
-    try:
-        return next(index for index, paragraph in enumerate(paragraphs) if CV_HEADINGS.get(_paragraph_text(paragraph), _paragraph_text(paragraph)) == text)
-    except StopIteration as error:
-        raise CvDocumentError(f"Section '{text}' missing from resume template") from error
+def document_hyperlinks(path: Path) -> dict[str, str]:
+    """Read visible links, including referenced headers and footers, excluding stale parts."""
+    from docx.oxml.ns import qn
+
+    document = Document(path)
+    parts = [document.part]
+    for section in document.sections:
+        for reference in section._sectPr:
+            if reference.tag in {W + "headerReference", W + "footerReference"}:
+                parts.append(document.part.related_parts[reference.get(qn("r:id"))])
+    result = {}
+    for part in parts:
+        for node in part.element.iter(W + "hyperlink"):
+            relation = part.rels.get(node.get(qn("r:id")))
+            label = "".join(t.text or "" for t in node.iter(W + "t"))
+            if relation is not None and relation.is_external and label:
+                if label in result and result[label] != relation.target_ref:
+                    raise CvDocumentError(f"Ambiguous hyperlink label: {label}")
+                result[label] = relation.target_ref
+    return result
 
 
-def _estimated_height(paragraphs, width: float) -> float:
-    """Estimate wrapping and vertical spacing without requiring an Office engine."""
-    height = previous_after = 0.0
-    for paragraph in paragraphs:
-        style = paragraph.style
-        normal = paragraph.part.document.styles["Normal"]
-        size = max((run.font.size.pt if run.font.size else
-                    (style.font.size or normal.font.size).pt for run in paragraph.runs), default=8.5)
-        formatting = paragraph.paragraph_format
-        inherited = style.paragraph_format
-        before = formatting.space_before if formatting.space_before is not None else inherited.space_before
-        after = formatting.space_after if formatting.space_after is not None else inherited.space_after
-        if after is None:
-            after = normal.paragraph_format.space_after
-        indent = formatting.left_indent.pt if formatting.left_indent else 0
-        available = max(1, width - indent)
-        lines = 0
-        # ponytail: approximate glyph widths; final PDF review remains necessary for Office font substitution.
-        for line in paragraph.text.split("\n"):
-            used = 0.0
-            lines += 1
-            for word in line.split():
-                word_width = sum(0.25 if char in "ilI.,:;'!|" else
-                                 0.8 if char in "MW@" else 0.4 for char in word) * size
-                if used and used + size * 0.25 + word_width > available:
-                    lines += 1
-                    used = 0
-                while word_width > available:
-                    lines += 1
-                    word_width -= available
-                used += word_width + size * 0.25
-        leading = formatting.line_spacing if formatting.line_spacing is not None else inherited.line_spacing
-        # Calibrated on the existing CV template and its validated one-page PDF.
-        line_height = leading.pt if hasattr(leading, "pt") else size * 1.65 * (leading or 1)
-        height += max(previous_after, before.pt if before else 0) + lines * line_height
-        previous_after = after.pt if after else 0
-    return height + previous_after
+def convert_cv_to_ats(source: Path, destination: Path, content: object | None = None, replace: bool = False) -> None:
+    """One renderer for CREATE, ADAPT, REUSE and content-preserving migration."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt, RGBColor
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
 
-
-def _balance_skills(root: ET.Element, entries: list, groups: list[list[ET.Element]]) -> None:
-    def measurements():
-        stream = io.BytesIO()
-        with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
-            for info, data in entries:
-                archive.writestr(info, ET.tostring(root) if info.filename == "word/document.xml" else data)
-        document = Document(stream)
-        left, right = document.tables[0].rows[0].cells
-        widths = []
-        for cell in (left, right):
-            margins = cell._tc.tcPr.find(W + "tcMar")
-            padding = sum(int(node.get(W + "w", "0")) / 20 for node in margins
-                          if node.tag in {W + "start", W + "end", W + "left", W + "right"}) if margins is not None else 0
-            widths.append(cell.width.pt - padding)
-        section = document.sections[0]
-        header = _estimated_height(document.paragraphs, section.page_width.pt - section.left_margin.pt - section.right_margin.pt)
-        return (_estimated_height(left.paragraphs, widths[0]), _estimated_height(right.paragraphs, widths[1]),
-                section.page_height.pt - section.top_margin.pt - section.bottom_margin.pt - header - 12)
-
-    left_height, right_height, available = measurements()
-    while left_height > right_height + 12 or left_height > available:
-        candidates = [group for group in groups if len(group) > 3]
-        if not candidates:
-            break
-        # Items arrive in descending relevance; never remove the first three of any category.
-        group = max(candidates, key=lambda items: (len(items), len(_paragraph_text(items[-1]))))
-        paragraph = group.pop()
-        next(parent for parent in root.iter() if paragraph in list(parent)).remove(paragraph)
-        left_height, right_height, available = measurements()
-    if max(left_height, right_height) > available:
-        raise CvDocumentError("Resume too long for one page: condense profile and projects without reducing font size or margins")
-    if abs(left_height - right_height) > 36:
-        logger.warning("Resume columns remain unbalanced: left %.0f pt, right %.0f pt; condense content if necessary.",
-                       left_height, right_height)
-
-
-def create_cv(source: Path, destination: Path, content: object, replace: bool = False) -> None:
     if destination.exists() and not replace:
         raise CvDocumentError(f"Target resume already exists : {destination.name}")
     validate_docx(source)
-    try:
-        with ZipFile(source) as archive:
-            xml = archive.read("word/document.xml")
-            entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
-        root = _parse_xml(xml)
-        paragraphs = list(root.iter(W + "p"))
+    header, sections = _cv_sections(source)
+    if len(header) < 3:
+        raise CvDocumentError("Resume identity header is incomplete")
+    if content is not None:
+        header[2] = content.headline
+        sections["PROFIL"] = [content.profile]
+        sections["COMPÉTENCES"] = [group.title + " : " + " · ".join(group.items) for group in content.skill_groups]
+        sections["PROJETS"] = [line for project in content.projects for line in (
+            project.title + "  |  " + project.technologies, project.description,
+            *["• " + bullet for bullet in project.bullets],
+        )]
+    else:
+        sections["COMPÉTENCES"] = _compact_skills(sections["COMPÉTENCES"])
 
-        _set_text(paragraphs[2], [content.headline])
-        profile = _find(paragraphs, "PROFIL")
-        _set_text(paragraphs[profile + 1], [content.profile])
+    document = Document(source)
+    body = document._element.body
+    for child in list(body):
+        if child.tag != W + "sectPr":
+            body.remove(child)
+    section = document.sections[0]
+    section.page_width, section.page_height = Cm(21), Cm(29.7)
+    section.top_margin = section.bottom_margin = Cm(1.524)
+    section.left_margin = section.right_margin = Cm(1.854)
+    cols = section._sectPr.find(W + "cols")
+    if cols is not None:
+        section._sectPr.remove(cols)
+    for tag in ("headerReference", "footerReference"):
+        for node in list(section._sectPr.findall(W + tag)):
+            section._sectPr.remove(node)
 
-        skills = _find(paragraphs, "COMPÉTENCES")
-        languages = _find(paragraphs, "LANGUES")
-        parents = {child: parent for parent in root.iter() for child in parent}
-        skill_section = parents[paragraphs[skills]]
-        skill_title = paragraphs[skills + 1]
-        skill_bullet = paragraphs[skills + 2]
-        insert_at = list(skill_section).index(paragraphs[skills]) + 1
-        for paragraph in paragraphs[skills + 1:languages]:
-            skill_section.remove(paragraph)
-        skill_rows = []
-        for group in content.skill_groups:
-            title = copy.deepcopy(skill_title)
-            _set_text(title, [group.title])
-            skill_section.insert(insert_at, title)
-            insert_at += 1
-            rows = []
-            for item in group.items:
-                bullet = copy.deepcopy(skill_bullet)
-                _set_text(bullet, ["• ", item])
-                skill_section.insert(insert_at, bullet)
-                rows.append(bullet)
-                insert_at += 1
-            skill_rows.append(rows)
+    # Measured from the Mews Partners reference. Content stays independent of these roles.
+    from docx.enum.style import WD_STYLE_TYPE
+    navy, ink, muted, accent = "19354B", "1F2A36", "5C6976", "246477"
+    roles = {
+        "Name": (20.5, navy, False, 0, 1, 1.0, True),
+        "Degree": (9.5, ink, True, 0, 1.4, 1.03, True),
+        "Focus": (9, accent, False, 0, 5.3, 1.04, True),
+        "Contact": (8, muted, False, 0, 5.5, 1.05, True),
+        "Section": (10, navy, True, 6.2, 3.4, 1.0, True),
+        "Body": (9, ink, False, 0, 2, 1.1, False),
+        "Skill": (9, ink, False, 0, 1.2, 1.08, False),
+        "Project": (9, ink, True, 4.2, 1.4, 1.05, True),
+        "Project Tech": (8, muted, False, 0, 1.6, 1.05, True),
+        "Project Desc": (8.5, muted, False, 0, 1.9, 1.07, True),
+        "Bullet": (8.5, ink, False, 0, 1.1, 1.07, False),
+        "Entry": (9, ink, True, 2, 1, 1.07, True),
+        "Entry Desc": (8.5, muted, False, 0, 1.4, 1.08, False),
+        "Last": (9, ink, False, 0, 0, 1.06, False),
+    }
+    for role, (size, color, bold, before, after, leading, keep) in roles.items():
+        name = "CV " + role
+        style = document.styles[name] if name in document.styles else document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        style.base_style = document.styles["Normal"]
+        style.font.name, style.font.size = "Arial", Pt(size)
+        style.font.color.rgb, style.font.bold = RGBColor.from_string(color), bold
+        style.font.italic = False
+        f = style.paragraph_format
+        f.space_before, f.space_after, f.line_spacing = Pt(before), Pt(after), leading
+        f.keep_with_next, f.keep_together, f.widow_control = keep, True, True
+        f.left_indent = f.right_indent = f.first_line_indent = Pt(0)
+        f.page_break_before = False
+    normal = document.styles["Normal"]
+    normal.font.name, normal.font.size = "Arial", Pt(9)
+    normal.font.color.rgb = RGBColor.from_string(ink)
 
-        projects = _find(paragraphs, "PROJETS SÉLECTIONNÉS")
-        formation = _find(paragraphs, "FORMATION")
-        parents = {child: parent for parent in root.iter() for child in parent}
-        section = parents[paragraphs[projects]]
-        if parents[paragraphs[formation]] is not section:
-            raise CvDocumentError("Incompatible projects and education sections")
-        title_template = paragraphs[projects + 1]
-        bullet_template = next(p for p in paragraphs[projects + 2:formation] if _paragraph_text(p).startswith("•"))
-        insert_at = list(section).index(paragraphs[projects]) + 1
-        for paragraph in paragraphs[projects + 1:formation]:
-            section.remove(paragraph)
-        for project in content.projects:
-            title = copy.deepcopy(title_template)
-            _set_text(title, [project.title, f"  |  {project.technologies}"])
-            section.insert(insert_at, title)
-            insert_at += 1
-            description = copy.deepcopy(bullet_template)
-            _set_text(description, ["", project.description])
-            indentation = description.find(f"{W}pPr/{W}ind")
-            if indentation is not None:
-                description.find(W + "pPr").remove(indentation)
-            for properties in description.iter(W + "rPr"):
-                for tag, value in (("i", "1"), ("b", "0"), ("color", "637083")):
-                    node = properties.find(W + tag)
-                    if node is None:
-                        node = ET.SubElement(properties, W + tag)
-                    node.set(W + "val", value)
-            section.insert(insert_at, description)
-            insert_at += 1
-            for value in project.bullets:
-                bullet = copy.deepcopy(bullet_template)
-                _set_text(bullet, ["• ", value])
-                section.insert(insert_at, bullet)
-                insert_at += 1
+    def rule(p, color="CAD5DF", size="4", space="3"):
+        border = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        for key, value in (("val", "single"), ("sz", size), ("space", space), ("color", color)):
+            bottom.set(qn("w:" + key), value)
+        border.append(bottom)
+        p._p.get_or_add_pPr().append(border)
 
-        _balance_skills(root, entries, skill_rows)
-        updated_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    except CvDocumentError:
-        raise
-    except (BadZipFile, KeyError, ET.ParseError, OSError, AttributeError, IndexError, ValueError) as error:
-        raise CvDocumentError(f"Unable to adapt DOCX : {error}") from error
+    # Preserve named hyperlinks as well as visible URLs, including body links.
+    anchors = document_hyperlinks(source)
+    url_pattern = r"https?://[^\s·•]+|(?:www\.)?(?:linkedin\.com/[^\s·•]+|github\.com/[^\s·•]+|[\w-]+\.github\.io[^\s·•]*)|[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}"
+    pattern = "|".join([url_pattern] + [re.escape(label) for label in sorted(anchors, key=len, reverse=True)])
 
+    def add_text(p, text, bold=None, color=None):
+        cursor = 0
+        for match in re.finditer(pattern, text):
+            run = p.add_run(text[cursor:match.start()])
+            run.bold = bold
+            if color:
+                run.font.color.rgb = RGBColor.from_string(color)
+            label = match.group()
+            target = anchors.get(label) or (label if label.startswith(("http://", "https://", "mailto:")) else ("mailto:" if "@" in label else "https://") + label)
+            link = OxmlElement("w:hyperlink")
+            link.set(qn("r:id"), p.part.relate_to(target, RT.HYPERLINK, is_external=True))
+            run = OxmlElement("w:r")
+            props = OxmlElement("w:rPr")
+            value = OxmlElement("w:color"); value.set(qn("w:val"), accent); props.append(value)
+            run.append(props)
+            value = OxmlElement("w:t"); value.text = label; run.append(value)
+            link.append(run); p._p.append(link)
+            cursor = match.end()
+        run = p.add_run(text[cursor:])
+        run.bold = bold
+        if color:
+            run.font.color.rgb = RGBColor.from_string(color)
+
+    def paragraph(text, role="Body"):
+        p = document.add_paragraph(style="CV " + role)
+        if text.startswith("• "):
+            p.paragraph_format.left_indent, p.paragraph_format.first_line_indent = Cm(.36), Cm(-.26)
+        add_text(p, text)
+        return p
+
+    paragraph(header[0], "Name")
+    paragraph(header[1], "Degree")
+    paragraph(header[2], "Focus")
+    contact = " · ".join(header[3:])
+    for text in sections.get("LIENS", []):
+        for label in ("Portfolio", "GitHub", "LinkedIn"):
+            if text.startswith(label):
+                text = text[len(label):].lstrip(" :")
+                break
+        if text and text not in contact:
+            contact += (" · " if contact else "") + text
+    for label, target in anchors.items():
+        visible = target.removeprefix("https://").removeprefix("http://").removeprefix("mailto:")
+        if not any(label in text or visible in text for text in header) and not any(label in text or visible in text for title, values in sections.items() if title != "LIENS" for text in values) and target not in contact and visible not in contact:
+            contact += (" · " if contact else "") + target
+    p = paragraph(contact, "Contact")
+    rule(p, "A1BDCC", "7", "7")
+    for title in ATS_SECTIONS:
+        values = sections.get(title, [])
+        if not values:
+            continue
+        rule(paragraph(title, "Section"))
+        if title in {"LANGUES", "CENTRES D'INTÉRÊT"}:
+            paragraph(" · ".join(value.removeprefix("• ") for value in values), "Last")
+            continue
+        for index, text in enumerate(values):
+            if title == "PROJETS":
+                if " | " in text:
+                    first, rest = re.split(r"\s+\|\s+", text, maxsplit=1)
+                    paragraph(first, "Project")
+                    paragraph(rest, "Project Tech")
+                elif index > 0 and " | " in values[index - 1]:
+                    paragraph(text.removeprefix("• "), "Project Desc")
+                else:
+                    paragraph(text if text.startswith("• ") else "• " + text, "Bullet")
+            elif title == "COMPÉTENCES" and " : " in text:
+                first, separator, rest = text.partition(" : ")
+                p = document.add_paragraph(style="CV Skill")
+                add_text(p, first, bold=True, color=navy)
+                add_text(p, separator + rest)
+            elif title in {"FORMATION", "EXPÉRIENCES"}:
+                paragraph(text, "Entry" if " | " in text else "Bullet" if text.startswith("• ") else "Entry Desc")
+            else:
+                paragraph(text)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".docx", delete=False) as handle:
             temporary = Path(handle.name)
-        with ZipFile(temporary, "w", ZIP_DEFLATED) as output:
-            for info, data in entries:
-                output.writestr(info, updated_xml if info.filename == "word/document.xml" else data)
+        document.save(temporary)
         validate_docx(temporary)
         validate_cv_layout(temporary)
+        if content is None:
+            validate_cv_preservation(source, temporary)
         temporary.replace(destination)
-    except (OSError, BadZipFile, CvDocumentError) as error:
+    except OSError as error:
+        raise CvDocumentError(f"Unable to write resume : {error}") from error
+    finally:
         if temporary:
             temporary.unlink(missing_ok=True)
-        if isinstance(error, CvDocumentError):
-            raise
-        raise CvDocumentError(f"Unable to write resume : {error}") from error
+
+
+def validate_cv_preservation(source: Path, destination: Path) -> None:
+    """Compare semantic text in reading order and all used external hyperlinks."""
+    def words(values):
+        # Ignore layout separators only; preserve punctuation such as C++, C# and URLs.
+        text = " ".join(values)
+        text = re.sub(r"\s*(?:[•·]|\s[|:]\s)\s*", " ", text)
+        return " ".join(text.split())
+
+    old_header, old = _cv_sections(source)
+    new_header, new = _cv_sections(destination)
+    if words(old_header[:3]) != words(new_header[:3]) or not words(new_header[3:]).startswith(words(old_header[3:])):
+        raise CvDocumentError("Resume identity or contact content changed during conversion")
+    for title in ATS_SECTIONS:
+        if words(old.get(title, [])) != words(new.get(title, [])):
+            raise CvDocumentError(f"Resume content changed during conversion: {title}")
+
+    if not set(document_hyperlinks(source).values()) <= set(document_hyperlinks(destination).values()):
+        raise CvDocumentError("Resume hyperlink targets changed during conversion")
+
+
+
+def create_cv(source: Path, destination: Path, content: object, replace: bool = False) -> None:
+    convert_cv_to_ats(source, destination, content, replace)

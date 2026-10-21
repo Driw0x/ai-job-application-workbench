@@ -40,7 +40,7 @@ from .codex_client import (
 )
 from .cv_documents import (
     cv_template_path,
-    CvDocumentError, create_cv, cv_variants, document_text, next_variant_name,
+    CvDocumentError, convert_cv_to_ats, create_cv, cv_variants, document_text, next_variant_name,
     project_catalog, register_variant, validate_cv_layout, validate_cv_projects, validate_docx,
 )
 from .cv_pdf import (
@@ -81,7 +81,6 @@ DEFAULT_DB = Path(
 ).expanduser().resolve()
 DEFAULT_APPLICATIONS_ROOT = APP_ROOT / "data" / "applications"
 CV_ROOT = REPO_ROOT / "01_Career" / "CV" / "Generated"
-MAX_CONCURRENT_PREPARATIONS = 2
 DEFAULT_MAX_OFFER_AGE_DAYS = 90
 INTERVIEW_STATUSES = {"HR_INTERVIEW", "TECH_INTERVIEW", "FINAL_INTERVIEW"}
 INACTIVE_STATUSES = {"WITHDRAWN", "IGNORED"}
@@ -366,6 +365,7 @@ def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
             CREATE INDEX IF NOT EXISTS idx_events_application ON events(application_id, created_at);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT OR IGNORE INTO settings(key, value) VALUES('max_offers_per_generation', '0');
             CREATE TABLE IF NOT EXISTS ai_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -529,6 +529,16 @@ class Preparation(BaseModel):
     cv_variant: str | None = None
     cv_path: str | None = None
     application_channel: str | None = None
+
+
+class GenerationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_concurrent_preparations: int = Field(strict=True, ge=0)
+
+
+class BatchPreparation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    application_ids: list[int] = Field(min_length=1)
 
 
 class Discovery(BaseModel):
@@ -1385,6 +1395,10 @@ def create_app(
         configured = settings(db, "knowledge_base_root").get("knowledge_base_root")
         return Path(configured) if configured else api.state.repo_root.resolve()
 
+    def generation_settings(db: sqlite3.Connection) -> dict[str, int]:
+        # Keep the existing SQLite key to preserve saved values.
+        return {"max_concurrent_preparations": int(settings(db, "max_offers_per_generation").get("max_offers_per_generation", "0"))}
+
     def search_profile(db: sqlite3.Connection, mode: str | None = None) -> dict[str, Any]:
         root = search_kb_root(db)
         rows = settings(
@@ -1521,7 +1535,8 @@ def create_app(
             key: value if type(value := metadata.get(key)) is int and value >= 0 else None
             for key in ("input_tokens", "output_tokens", "total_tokens")
         }
-        with closing(database()) as db:
+        # Serialize SQLite writes; provider calls run outside this lock.
+        with api.state.preparation_lock, closing(database()) as db:
             db.execute(
                 """INSERT INTO ai_usage(created_at, provider, model, category, operation,
                     input_tokens, output_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1720,7 +1735,7 @@ def create_app(
                 per_query_stats[index].update({"status": "RUNNING", "search_call_count": 1})
                 snapshot()
                 try:
-                    query_results = provider.search(query, limit=12)
+                    query_results = provider.search(query)
                     provider_stats = getattr(provider, "last_stats", {})
                     per_query_stats[index].update({
                         "query": query,
@@ -1929,6 +1944,21 @@ def create_app(
                 db.execute("DELETE FROM settings WHERE key IN ('ai_provider', 'ai_auth_mode')")
                 db.commit()
         return {"connected": False}
+
+    @api.get("/settings/generation")
+    def get_generation_settings() -> dict[str, int]:
+        with closing(database()) as db:
+            return generation_settings(db)
+
+    @api.put("/settings/generation")
+    def update_generation_settings(payload: GenerationSettings) -> dict[str, int]:
+        with api.state.preparation_lock:
+            with closing(database()) as db:
+                write_settings(db, {"max_offers_per_generation": str(payload.max_concurrent_preparations)})
+                db.commit()
+                result = generation_settings(db)
+        start_queued_preparations()
+        return result
 
     @api.get("/settings/search-profile")
     def get_search_profile(mode: Literal["knowledge_base", "custom_prompt"] | None = None) -> dict[str, Any]:
@@ -2531,6 +2561,7 @@ def create_app(
             path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             content_disposition_type="inline",
+            headers={"Cache-Control": "no-store"},
         )
 
     @api.get("/applications/{application_id}/cv.docx")
@@ -2546,6 +2577,7 @@ def create_app(
             path,
             filename=path.name,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Cache-Control": "no-store"},
         )
 
     @api.get("/applications/{application_id}/cv.pdf")
@@ -3092,8 +3124,7 @@ def create_app(
                 if decision.action == "REUSE":
                     if decision.content is not None:
                         raise CvDocumentError("REUSE must not supply modified content")
-                    validate_cv_layout(cv_source)
-                    shutil.copy2(cv_source, destination)
+                    convert_cv_to_ats(cv_source, destination, replace=True)
                     validate_docx(destination)
                 else:
                     if decision.content is None:
@@ -3197,7 +3228,7 @@ def create_app(
                         raise HTTPException(422, f"Unable to create global variant : {error}") from error
                 paths["cv_variant"] = generated_variant
 
-            with closing(database()) as db:
+            with api.state.preparation_lock, closing(database()) as db:
                 assignments = ", ".join(f"{field} = ?" for field in paths)
                 db.execute(f"UPDATE applications SET {assignments}, updated_at=? WHERE id=?",
                            [*paths.values(), now(), application_id])
@@ -3232,13 +3263,9 @@ def create_app(
                 if not artifacts["complete"]:
                     raise HTTPException(422, {"message": "Incomplete preparation", **artifacts})
                 change_status(db, application_id, "PREPARED", "AI preparation completed")
-        except HTTPException as error:
-            with closing(database()) as db:
-                add_event(db, application_id, "PREPARATION_FAILED", str(error.detail))
-                db.commit()
         except Exception as error:
-            with closing(database()) as db:
-                add_event(db, application_id, "PREPARATION_FAILED", str(error))
+            with api.state.preparation_lock, closing(database()) as db:
+                add_event(db, application_id, "PREPARATION_FAILED", str(error.detail if isinstance(error, HTTPException) else error))
                 db.commit()
         finally:
             finish_preparation(application_id)
@@ -3247,25 +3274,30 @@ def create_app(
         threading.Thread(target=run_preparation, args=(application_id,), daemon=True).start()
 
     def finish_preparation(application_id: int) -> None:
-        next_application_id = None
         with api.state.preparation_lock:
             api.state.active_preparations -= 1
             api.state.preparation_jobs.discard(application_id)
-            if api.state.preparation_queue:
-                next_application_id = api.state.preparation_queue.popleft()
-                api.state.active_preparations += 1
-                with closing(database()) as db:
-                    add_event(db, next_application_id, "PREPARATION_STARTED", "AI preparation started")
-                    db.commit()
-        if next_application_id is not None:
-            start_preparation(next_application_id)
+        start_queued_preparations()
+
+    def start_queued_preparations() -> None:
+        starting = []
+        with api.state.preparation_lock:
+            with closing(database()) as db:
+                limit = generation_settings(db)["max_concurrent_preparations"]
+                while api.state.preparation_queue and (limit == 0 or api.state.active_preparations < limit):
+                    application_id = api.state.preparation_queue.popleft()
+                    api.state.active_preparations += 1
+                    add_event(db, application_id, "PREPARATION_STARTED", "AI preparation started")
+                    starting.append(application_id)
+                db.commit()
+        for application_id in starting:
+            start_preparation(application_id)
 
     def enqueue_preparation(application_id: int) -> dict[str, Any]:
         if not knowledge_base_available(api.state.repo_root):
             raise HTTPException(
                 409, "A Knowledge Base or candidate profile is required to prepare an application.",
             )
-        start_now = False
         with api.state.preparation_lock:
             with closing(database()) as db:
                 application = get_application(db, application_id)
@@ -3276,19 +3308,13 @@ def create_app(
                 active_settings(db)
                 if application_id in api.state.preparation_jobs:
                     raise HTTPException(409, "This preparation is already queued or running")
-                api.state.preparation_jobs.add(application_id)
-                if api.state.active_preparations < MAX_CONCURRENT_PREPARATIONS:
-                    api.state.active_preparations += 1
-                    add_event(db, application_id, "PREPARATION_STARTED", "AI preparation started")
-                    start_now = True
-                else:
-                    api.state.preparation_queue.append(application_id)
-                    add_event(db, application_id, "PREPARATION_QUEUED", "AI preparation queued")
+                add_event(db, application_id, "PREPARATION_QUEUED", "AI preparation queued")
                 db.commit()
-                result = application_view(db, get_application(db, application_id))
-        if start_now:
-            start_preparation(application_id)
-        return result
+                api.state.preparation_jobs.add(application_id)
+                api.state.preparation_queue.append(application_id)
+        start_queued_preparations()
+        with closing(database()) as db:
+            return application_view(db, get_application(db, application_id))
 
     @api.post("/applications/{application_id}/prepare-with-codex")
     def prepare_with_codex(application_id: int) -> dict[str, Any]:
@@ -3308,6 +3334,26 @@ def create_app(
                     raise HTTPException(409, "This job was already selected or processed")
                 change_status(db, application_id, "SHORTLISTED", "Job selected by user")
         return enqueue_preparation(application_id)
+
+    @api.post("/applications/prepare-batch")
+    def prepare_batch(payload: BatchPreparation) -> dict[str, Any]:
+        application_ids = list(dict.fromkeys(payload.application_ids))
+        applications, errors = [], []
+        for application_id in application_ids:
+            try:
+                with closing(database()) as db:
+                    application = application_view(db, get_application(db, application_id))
+                if application["eligibility_status"] == "INELIGIBLE":
+                    raise HTTPException(409, f"Preparation not allowed: {application['eligibility_reason']}")
+                if application["status"] == "DETECTED":
+                    applications.append(select_application(application_id))
+                elif application["status"] == "SHORTLISTED" and application["preparation_state"] == "failed":
+                    applications.append(enqueue_preparation(application_id))
+                else:
+                    raise HTTPException(409, "This job was already selected or processed")
+            except HTTPException as error:
+                errors.append({"application_id": application_id, "detail": error.detail})
+        return {"applications": applications, "errors": errors}
 
     @api.get("/stats/ai-usage")
     def ai_usage_stats(period: Literal["today", "7d", "30d", "all"] = "7d") -> dict[str, Any]:

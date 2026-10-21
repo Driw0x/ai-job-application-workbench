@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, ComponentProps } from "react";
 import { createRoot, Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserRouter } from "react-router-dom";
@@ -8,7 +8,7 @@ import { BrowserRouter } from "react-router-dom";
 vi.mock("docx-preview", () => ({ renderAsync: vi.fn() }));
 
 import { renderAsync } from "docx-preview";
-import App, { AiUsageCard, ApplicationList, CoverLetterViewer, CvViewer, Detail, DocxPreview, FileLink, Kanban, MarkdownViewer } from "./App";
+import App, { AiUsageCard, ApplicationList, BatchDocumentGeneration, CoverLetterViewer, CvViewer, Detail, DocxPreview, FileLink, Kanban, MarkdownViewer } from "./App";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -39,6 +39,136 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => root.unmount()); host.remove(); vi.restoreAllMocks(); window.history.replaceState(null, "", "/");
+});
+
+describe("Batch Document Generation", () => {
+  const offers = Array.from({ length: 12 }, (_, index) => ({ ...application, id: index + 1, company: `Company ${index + 1}`, status: "DETECTED" }));
+  const refresh = vi.fn().mockResolvedValue(undefined); const open = vi.fn();
+  function mockBatchApi(initialLimit = 0) {
+    let limit = initialLimit;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (String(input).endsWith("/settings/generation")) {
+        if (init?.method === "PUT") limit = JSON.parse(String(init.body)).max_concurrent_preparations;
+        return { ok: true, json: async () => ({ max_concurrent_preparations: limit }) } as Response;
+      }
+      const ids = JSON.parse(String(init?.body)).application_ids as number[];
+      return { ok: true, json: async () => ({ applications: offers.filter(item => ids.includes(item.id)), errors: [] }) } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+  async function renderBatch(items: ComponentProps<typeof BatchDocumentGeneration>["applications"] = offers, key = 0, canPrepare = true) {
+    await act(async () => root.render(<BatchDocumentGeneration key={key} applications={items} preparing={new Set()} refresh={refresh} canPrepare={canPrepare} disabledReason="Select a preparation provider." open={open} />));
+    await flush();
+  }
+  const input = () => host.querySelector('input[type="number"]') as HTMLInputElement;
+  const button = (label: string) => [...host.querySelectorAll("button")].find(item => item.textContent === label)!;
+  async function changeLimit(value: string) {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input(), value);
+      input().dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+  async function selectOffers(count: number) {
+    await act(async () => [...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].slice(0, count).forEach(item => item.click()));
+  }
+
+  it("displays the default setting and empty state on the dashboard", async () => {
+    mockBatchApi(); await renderBatch([]);
+    expect(host.textContent).toContain("Batch Document Generation");
+    expect(input().value).toBe("0");
+    expect(host.textContent).toContain("0 = Unlimited");
+    expect(host.textContent).toContain("Saved concurrency limit: Unlimited.");
+    expect(host.textContent).toContain("Concurrent preparations");
+    expect(host.textContent).toContain("This limits simultaneous preparations, not batch size.");
+    expect(host.textContent).toContain("No offers available for preparation.");
+    expect(button("Prepare selected offers").disabled).toBe(true);
+  });
+
+  it.each(["-1", "1.5", "1.0", "", "invalid", "9007199254740992"])("rejects invalid setting %s before saving", async value => {
+    const fetchMock = mockBatchApi(); await renderBatch(); await changeLimit(value);
+    expect(input().getAttribute("aria-invalid")).toBe("true");
+    expect(host.textContent).toContain("Concurrent preparations must be a non-negative integer.");
+    await act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+  });
+
+  it("saves and restores concurrency without limiting selected offers", async () => {
+    const fetchMock = mockBatchApi(); await renderBatch(); await selectOffers(3);
+    await changeLimit("1");
+    expect(button("Prepare selected offers").disabled).toBe(false);
+    await act(async () => button("Save").click()); await flush();
+    expect(host.textContent).toContain("Concurrency setting saved.");
+    expect(host.textContent).toContain("Saved concurrency limit: 1.");
+    expect(button("Prepare selected offers").disabled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/settings/generation"), expect.objectContaining({ method: "PUT", body: JSON.stringify({ max_concurrent_preparations: 1 }) }));
+    await renderBatch(offers, 1);
+    expect(input().value).toBe("1");
+    await selectOffers(3); await changeLimit("0"); await act(async () => button("Save").click()); await flush();
+    expect(button("Prepare selected offers").disabled).toBe(false);
+  });
+
+  it.each([1, 2, 0])("accepts all selected offers with concurrency limit %s", async limit => {
+    const fetchMock = mockBatchApi(limit); await renderBatch(); await selectOffers(12);
+    expect(button("Prepare selected offers").disabled).toBe(false);
+    expect(host.textContent).not.toContain("The batch limit");
+    await act(async () => button("Prepare selected offers").click()); await flush();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/applications/prepare-batch"), expect.objectContaining({ method: "POST", body: JSON.stringify({ application_ids: offers.map(item => item.id) }) }));
+  });
+
+  it("submits more than ten offers when unlimited and refreshes progress", async () => {
+    const fetchMock = mockBatchApi(); await renderBatch(); await selectOffers(12);
+    await act(async () => button("Prepare selected offers").click()); await flush();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/applications/prepare-batch"), expect.objectContaining({ method: "POST", body: JSON.stringify({ application_ids: offers.map(item => item.id) }) }));
+    expect(host.textContent).toContain("Accepted for preparation: 12. Rejected: 0.");
+    expect(refresh).toHaveBeenCalled();
+    const progress = offers.slice(0, 4).map((item, index) => ({ ...item, status: index === 3 ? "PREPARED" : "SHORTLISTED", preparation_state: ["queued", "running", "failed", "completed"][index] as "queued" | "running" | "failed" | "completed", preparation_error: index === 2 ? "Provider timed out" : undefined }));
+    await renderBatch(progress);
+    for (const message of ["Queued for preparation", "Preparing with AI…", "Preparation failed", "Preparation complete", "Provider timed out"]) expect(host.textContent).toContain(message);
+    expect([...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].map(item => item.disabled)).toEqual([true, true, false, true]);
+  });
+
+  it("prevents duplicate submissions while a batch request is pending", async () => {
+    const fetchMock = mockBatchApi(); await renderBatch(); await selectOffers(1);
+    let resolve!: (value: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    await act(async () => { const submit = button("Prepare selected offers"); submit.click(); submit.click(); });
+    expect(host.textContent).toContain("Submitting batch…");
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/applications/prepare-batch"))).toHaveLength(1);
+    await act(async () => resolve({ ok: true, json: async () => ({ applications: [offers[0]], errors: [] }) } as Response));
+  });
+
+  it("renders server validation and per-offer errors", async () => {
+    const fetchMock = mockBatchApi(); await renderBatch(); await selectOffers(2);
+    fetchMock.mockResolvedValueOnce({ ok: false, json: async () => ({ detail: "Preparation service unavailable." }) } as Awaited<ReturnType<typeof fetchMock>>);
+    await act(async () => button("Prepare selected offers").click()); await flush();
+    expect(host.textContent).toContain("Preparation service unavailable.");
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ applications: [offers[0]], errors: [{ application_id: 2, detail: "This preparation is already queued or running" }] }) } as Awaited<ReturnType<typeof fetchMock>>);
+    await act(async () => button("Prepare selected offers").click()); await flush();
+    expect(host.textContent).toContain("Accepted for preparation: 1. Rejected: 1.");
+    expect(host.textContent).toContain("Offer 2: This preparation is already queued or running");
+  });
+
+  it("keeps the saved limit after a save failure and renders loading errors", async () => {
+    const fetchMock = mockBatchApi(3); await renderBatch(); await changeLimit("1");
+    fetchMock.mockRejectedValueOnce(new Error("Unable to save batch setting"));
+    await act(async () => button("Save").click()); await flush();
+    expect(host.textContent).toContain("Unable to save batch setting");
+    expect(host.textContent).toContain("Saved concurrency limit: 3.");
+    fetchMock.mockRejectedValueOnce(new Error("Unable to load batch setting"));
+    await renderBatch(offers, 1);
+    expect(host.textContent).toContain("Unable to load batch setting");
+    expect(button("Prepare selected offers").disabled).toBe(true);
+  });
+
+  it("respects preparation safeguards and excludes ineligible offers", async () => {
+    mockBatchApi(); await renderBatch([{ ...offers[0], eligibility_status: "INELIGIBLE" }]);
+    expect(host.querySelector('input[type="checkbox"]')).toBeNull();
+    await renderBatch(offers, 0, false);
+    expect(host.textContent).toContain("Select a preparation provider.");
+    expect([...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(item => item.disabled)).toBe(true);
+    expect(button("Prepare selected offers").disabled).toBe(true);
+  });
 });
 
 describe("suivi contextuel", () => {
@@ -292,6 +422,18 @@ describe("mapping Kanban", () => {
     ignore: vi.fn().mockResolvedValue(undefined), mutate: vi.fn().mockResolvedValue(null),
   };
 
+  it("affiche les 100 offres retenues dans SEARCH sans plafond", async () => {
+    const applications = Array.from({ length: 100 }, (_, index) => ({
+      ...application, id: index + 1, company: `Company ${index + 1}`, status: "DETECTED",
+    }));
+    await act(async () => root.render(<Kanban applications={[...applications, { ...application, id: 101 }]} preparing={new Set()} canPrepare {...callbacks} />));
+    const search = host.querySelector(".kanban section")!;
+    expect(search.querySelector("h3")?.textContent).toBe("SEARCH (100)");
+    expect(search.querySelectorAll(".ticket")).toHaveLength(100);
+    expect([...search.querySelectorAll(".ticket b")].map(company => company.textContent)).toEqual(applications.map(item => item.company));
+    expect(host.querySelectorAll(".kanban section")[1].querySelectorAll(".ticket")).toHaveLength(1);
+  });
+
   it("place WITHDRAWN uniquement dans WITHDRAW sans déplacer les autres colonnes", async () => {
     const trackingStatuses = ["SENT", "ACKNOWLEDGED", "HR_INTERVIEW", "TECH_INTERVIEW", "FINAL_INTERVIEW", "OFFER", "REJECTED", "NO_RESPONSE"];
     const applications = [
@@ -302,14 +444,32 @@ describe("mapping Kanban", () => {
       { ...application, id: 12, company: "Retirée", status: "WITHDRAWN" },
     ];
     await act(async () => root.render(<Kanban applications={applications} preparing={new Set()} canPrepare {...callbacks} />));
-    const column = (name: string) => [...host.querySelectorAll(".kanban section")].find(section => section.querySelector("h3")?.textContent === name) as HTMLElement;
-    expect([...host.querySelectorAll(".kanban h3")].map(heading => heading.textContent)).toEqual(["SEARCH", "REVIEW", "SUBMIT", "TRACK", "WITHDRAW"]);
+    const column = (name: string) => [...host.querySelectorAll(".kanban section")].find(section => section.querySelector("h3")?.textContent?.startsWith(`${name} (`)) as HTMLElement;
+    expect([...host.querySelectorAll(".kanban h3")].map(heading => heading.textContent)).toEqual(["SEARCH (1)", "REVIEW (1)", "SUBMIT (1)", "TRACK (8)", "WITHDRAW (1)"]);
     expect(column("SEARCH").textContent).toContain("Search");
     expect(column("REVIEW").textContent).toContain("Review");
     expect(column("SUBMIT").textContent).toContain("Submit");
     expect(column("TRACK").textContent).not.toContain("Retirée");
     trackingStatuses.forEach(status => expect(column("TRACK").textContent).toContain(status));
     expect(column("WITHDRAW").textContent).toContain("Retirée");
+  });
+
+  it("met à jour les compteurs après ajout, changement de statut et retrait", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const render = async (applications: typeof application[], counts: number[]) => {
+      await act(async () => root.render(<Kanban applications={applications} preparing={new Set()} canPrepare {...callbacks} />));
+      const sections = [...host.querySelectorAll(".kanban section")];
+      expect(sections.map(section => Number(section.querySelector("h3")?.textContent?.match(/\((\d+)\)$/)?.[1]))).toEqual(counts);
+      sections.forEach((section, index) => expect(section.querySelectorAll(".ticket")).toHaveLength(counts[index]));
+    };
+    const detected = { ...application, id: 1, status: "DETECTED" };
+    const ignored = { ...application, id: 2, status: "IGNORED" };
+    await render([], [0, 0, 0, 0, 0]);
+    await render([detected, ignored], [1, 0, 0, 0, 0]);
+    await render([{ ...detected, status: "SHORTLISTED" }, ignored], [0, 1, 0, 0, 0]);
+    await render([ignored], [0, 0, 0, 0, 0]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -654,6 +814,7 @@ describe("routing SPA", () => {
           screening: { provider: "default", effort: "medium" }, deep_analysis: { provider: "default", effort: "medium" },
           company_analysis: { provider: "default", effort: "medium" }, application_preparation: { provider: "default", effort: "medium" },
         }, ai_fallback: null }
+        : url.endsWith("/settings/generation") ? { max_concurrent_preparations: 0 }
         : url.endsWith("/settings/search-profile") ? savedProfile ?? (activeNoWeb
           ? { mode: "custom_prompt", custom_search_prompt: "", knowledge_base_available: false, knowledge_base_sources: [], knowledge_base_files: [], knowledge_base_selected_files: [], candidate_profile_available: false }
           : { mode: "knowledge_base", custom_search_prompt: "", knowledge_base_available: true, knowledge_base_sources: ["Profile", "Domaines", "Objectif professionnel"], knowledge_base_files: [{ path: "01_Career/Profile.md", label: "Profile" }, { path: "01_Career/Domaines.md", label: "Domaines" }, { path: "01_Career/Stage M2.md", label: "Objectif professionnel" }, { path: "02_Projects/Projet.md", label: "Projet" }], knowledge_base_selected_files: ["01_Career/Profile.md", "01_Career/Domaines.md", "01_Career/Stage M2.md"], candidate_profile_available: true })
@@ -680,6 +841,12 @@ describe("routing SPA", () => {
     ]);
     expect(host.querySelector(".search-profile")?.nextElementSibling).toBe(host.querySelector(".ai-usage"));
     expect(host.querySelector(".ai-usage")?.nextElementSibling).toBe(host.querySelector(".cards"));
+    expect(host.querySelector("main > header h2")?.textContent).toBe("Dashboard");
+    expect(host.querySelector("main > section")).toBe(host.querySelector(".batch-generation"));
+    expect(host.querySelector(".batch-generation")?.nextElementSibling).toBe(host.querySelector(".ai-provider"));
+    expect(host.textContent).not.toContain("Due today");
+    expect(host.textContent).toContain("Suggested follow-ups after 10 days");
+    expect(host.textContent).toContain("Upcoming interviews");
   });
 
   describe("récence des new jobs", () => {
@@ -2006,6 +2173,35 @@ describe("routing SPA", () => {
     expect(confirm).not.toHaveBeenCalled();
   });
 
+  it("submits selected dashboard offers through one batch request and renders queue progress", async () => {
+    let items = [7, 8].map(id => ({ ...application, id, company: `Company ${id}`, status: "DETECTED", preparation_state: undefined as "queued" | undefined }));
+    const fetchMock = mockApi(); const initial = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/ai/config")) {
+        const config = await (await initial(input, init)).json();
+        return { ok: true, json: async () => ({ ...config, capabilities: { ...config.capabilities, structured_output: true } }) } as Response;
+      }
+      if (url.endsWith("/applications/prepare-batch")) {
+        items = items.map(item => ({ ...item, status: "SHORTLISTED", preparation_state: "queued" }));
+        return { ok: true, json: async () => ({ applications: items, errors: [] }) } as Response;
+      }
+      if (url.endsWith("/applications")) return { ok: true, json: async () => items } as Response;
+      return initial(input, init);
+    });
+    window.history.replaceState(null, "", "/");
+    await act(async () => root.render(<BrowserRouter><App /></BrowserRouter>)); await flush();
+    const panel = host.querySelector(".batch-generation")!;
+    expect(panel.textContent).toContain("Batch Document Generation");
+    await act(async () => panel.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach(item => item.click()));
+    await act(async () => [...panel.querySelectorAll("button")].find(item => item.textContent === "Prepare selected offers")!.click()); await flush();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/applications/prepare-batch"), expect.objectContaining({ method: "POST", body: JSON.stringify({ application_ids: [7, 8] }) }));
+    expect(panel.textContent).toContain("Accepted for preparation: 2. Rejected: 0.");
+    expect(panel.querySelectorAll(".batch-offer")).toHaveLength(2);
+    expect(panel.textContent?.match(/Queued for preparation/g)).toHaveLength(2);
+    expect([...panel.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(item => item.disabled)).toBe(true);
+  });
+
   it("charge une URL directe et affiche une erreur pour un id inconnu", async () => {
     mockApi(); window.history.replaceState(null, "", "/applications/7/analysis");
     await act(async () => root.render(<BrowserRouter><App /></BrowserRouter>)); await flush();
@@ -2098,7 +2294,7 @@ describe("viewers intégrés", () => {
     vi.stubGlobal("fetch", fetchMock);
     await act(async () => root.render(<CoverLetterViewer application={application} back={back} />));
     expect(host.textContent).toContain("Loading cover letter…");
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/cover-letter.docx"));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/cover-letter.docx"), { cache: "no-store" });
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/cover-letter.pdf"))).toBe(false);
     resolveDocx({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) });
     await flush();
@@ -2185,6 +2381,31 @@ describe("viewers intégrés", () => {
     expect(host.querySelector(".docx-viewer.ready")?.textContent).toBe("Document 8");
   });
 
+  it("actualise la prévisualisation après modification du CV", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const back = vi.fn();
+    await act(async () => root.render(<CvViewer application={application} back={back} />));
+    await flush();
+    await act(async () => root.render(<CvViewer application={{ ...application, updated_at: "2026-10-08T12:00:00Z" }} back={back} />));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("?v=2026-10-08T12%3A00%3A00Z"), { cache: "no-store" });
+  });
+
+  it("recharge le CV associé lorsque seul son chemin change, sans génération", async () => {
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _options?: RequestInit) => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const back = vi.fn();
+    await act(async () => root.render(<CvViewer application={application} back={back} />));
+    await flush();
+    await act(async () => root.render(<CvViewer application={{ ...application, cv_path: "cv/replacement.docx" }} back={back} />));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("cv%2Freplacement.docx"), { cache: "no-store" });
+    expect(fetchMock.mock.calls.every(([url, options]) => String(url).includes("/applications/7/cv?") && !(options as RequestInit)?.method)).toBe(true);
+  });
+
   it("prévisualise le DOCX mais exporte le PDF natif du backend", async () => {
     let resolveFetch!: (value: object) => void;
     const back = vi.fn();
@@ -2194,7 +2415,7 @@ describe("viewers intégrés", () => {
     expect(host.textContent).toContain("Loading resume…");
     resolveFetch({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) });
     await flush();
-    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/applications/7/cv"));
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/applications/7/cv"), { cache: "no-store" });
     expect(renderAsync).toHaveBeenCalledOnce();
     const downloadLink = [...host.querySelectorAll("a")].find(link => link.textContent === "Download DOCX") as HTMLAnchorElement;
     expect(downloadLink.href).toContain("/applications/7/cv.docx");

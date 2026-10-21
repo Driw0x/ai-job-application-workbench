@@ -31,6 +31,44 @@ def create(application_client: TestClient, url: str = "https://example.com/job/?
     return response.json()
 
 
+def test_generation_setting_defaults_and_persists_across_restart(tmp_path):
+    api = client(tmp_path)
+    assert api.get("/settings/generation").json() == {"max_concurrent_preparations": 0}
+    for limit in (1, 3, 10, 0, 25):
+        response = api.put("/settings/generation", json={"max_concurrent_preparations": limit})
+        assert response.status_code == 200
+        assert response.json() == {"max_concurrent_preparations": limit}
+        assert api.get("/settings/generation").json() == response.json()
+    with connect(tmp_path / "test.db") as db:
+        assert db.execute("SELECT value FROM settings WHERE key='max_offers_per_generation'").fetchone()[0] == "25"
+    assert client(tmp_path).get("/settings/generation").json() == {"max_concurrent_preparations": 25}
+
+
+def test_generation_setting_reuses_existing_sqlite_value(tmp_path):
+    api = client(tmp_path)
+    with connect(tmp_path / "test.db") as db:
+        db.execute("UPDATE settings SET value='2' WHERE key='max_offers_per_generation'")
+        db.commit()
+    restarted = client(tmp_path)
+    assert restarted.get("/settings/generation").json() == {"max_concurrent_preparations": 2}
+    assert restarted.put("/settings/generation", json={"max_concurrent_preparations": 1}).status_code == 200
+    with connect(tmp_path / "test.db") as db:
+        assert db.execute("SELECT value FROM settings WHERE key='max_offers_per_generation'").fetchone()[0] == "1"
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, 1.0, "3", "invalid", None, True, [], {}])
+def test_generation_setting_rejects_invalid_values_without_changing_limit(tmp_path, value):
+    api = client(tmp_path)
+    api.put("/settings/generation", json={"max_concurrent_preparations": 3})
+    assert api.put("/settings/generation", json={"max_concurrent_preparations": value}).status_code == 422
+    assert api.get("/settings/generation").json() == {"max_concurrent_preparations": 3}
+
+
+@pytest.mark.parametrize("payload", [{}, {"max_concurrent_preparations": 0, "extra": 1}])
+def test_generation_setting_requires_only_expected_field(tmp_path, payload):
+    assert client(tmp_path).put("/settings/generation", json=payload).status_code == 422
+
+
 def complete_preparation(database: Path, applications_root: Path, application_id: int) -> None:
     with connect(database) as db:
         company, position = db.execute(
@@ -446,6 +484,41 @@ def test_cv_preview_endpoint_is_inline_docx_and_rejects_unassociated_paths(tmp_p
         db.execute("UPDATE applications SET cv_path=? WHERE id=?", ("../../outside.docx", application_id))
         db.commit()
     assert api.get(f"/applications/{application_id}/cv").status_code == 400
+
+
+@pytest.mark.parametrize("route", ["cv", "cv.docx"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_cv_reads_current_reference_without_generation_or_mutation(tmp_path, monkeypatch, route, relative):
+    database = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    applications = tmp_path / "applications"
+    repo.mkdir()
+    applications.mkdir()
+    original, replacement = repo / "historical.docx", applications / "replacement.docx"
+    original.write_bytes(b"historical layout")
+    replacement.write_bytes(b"replacement layout")
+    def unexpected(*args, **kwargs):
+        pytest.fail("Opening a CV must not render or convert documents")
+    monkeypatch.setattr(main, "create_cv", unexpected)
+    monkeypatch.setattr(main, "convert_cv_to_ats", unexpected)
+    api = TestClient(create_app(database, applications, repo_root=repo, pdf_converter=unexpected))
+    application_id = create(api)["id"]
+    for path in (original, replacement):
+        value = str(path.relative_to(repo)) if relative and path.is_relative_to(repo) else str(path)
+        with connect(database) as db:
+            db.execute("UPDATE applications SET cv_path=?, status='PREPARED' WHERE id=?", (value, application_id))
+            db.commit()
+            before = db.iterdump()
+            snapshot = list(before)
+        response = api.get(f"/applications/{application_id}/{route}")
+        assert response.status_code == 200
+        assert response.content == path.read_bytes()
+        assert response.headers["cache-control"] == "no-store"
+        with connect(database) as db:
+            assert list(db.iterdump()) == snapshot
+    replacement.write_bytes(b"changed at the same path")
+    assert api.get(f"/applications/{application_id}/{route}").content == replacement.read_bytes()
+    assert original.read_bytes() == b"historical layout"
 
 
 def test_cv_docx_download_returns_canonical_file_without_pdf_conversion(tmp_path: Path) -> None:
