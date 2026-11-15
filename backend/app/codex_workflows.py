@@ -12,6 +12,11 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .company_profiles import valid_postal_address, valid_source_url
+from .cover_letters import (
+    COVER_LETTER_WRITING_RULES,
+    normalize_cover_letter_punctuation,
+    validate_cover_letter_writing,
+)
 from .cv_documents import CvDocumentError, cv_template_path, document_text, project_catalog
 from .search_providers import canonical_url
 
@@ -147,16 +152,43 @@ class CvProject(StrictModel):
     bullets: list[str] = Field(min_length=2, max_length=3)
 
 
+class CvCertification(StrictModel):
+    model_config = ConfigDict(json_schema_extra=lambda schema: schema.update(required=list(schema["properties"])))
+    label: str = Field(min_length=1)
+    year: int | None = None
+
+
 class CvContent(StrictModel):
+    model_config = ConfigDict(json_schema_extra=lambda schema: schema.update(required=list(schema["properties"])))
     headline: str = Field(min_length=1)
     profile: str = Field(min_length=1)
     skill_groups: list[CvSkillGroup] = Field(min_length=4, max_length=4)
+    certifications: list[CvCertification] = Field(default_factory=list)
     projects: list[CvProject] = Field(min_length=1, max_length=4)
+
+
+class CvProjectMetric(StrictModel):
+    project_id: str = Field(min_length=1)
+    bullet: str | None
+    source_path: str | None
+    source_quote: str | None
+    missing_reason: str | None
+
+    @model_validator(mode="after")
+    def evidence_or_explicit_gap(self):
+        evidence = (self.bullet, self.source_path, self.source_quote)
+        if self.missing_reason is not None:
+            if len(self.missing_reason.strip()) < 20 or any(value is not None for value in evidence):
+                raise ValueError("Metric gap requires a reason and proposed measurement, without evidence")
+        elif any(value is None or not value.strip() for value in evidence):
+            raise ValueError("Project metric requires a bullet, source path and exact source quote")
+        return self
 
 
 class CvRefreshOutput(StrictModel):
     content: CvContent
     local_sources: list[str] = Field(min_length=1)
+    project_metrics: list[CvProjectMetric] = Field(min_length=1, max_length=4)
 
 
 class CvDecision(StrictModel):
@@ -171,6 +203,7 @@ class CvDecision(StrictModel):
     project_order: list[str] = Field(min_length=1, max_length=4)
     content: CvContent | None
     reusable_content: CvContent | None
+    project_metrics: list[CvProjectMetric] = Field(min_length=1, max_length=4)
 
     @field_validator("source_variant", "source_path", "target_filename")
     @classmethod
@@ -279,6 +312,9 @@ class CoverLetterContent(StrictModel):
     def non_blank_cover_letter_fields(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("Cover letter fields must not be blank")
+        if value is not None:
+            value = normalize_cover_letter_punctuation(value)
+            validate_cover_letter_writing(value)
         return value.strip() if value is not None else None
 
     @property
@@ -310,33 +346,62 @@ CV_WRITING_RULES = """RÈGLES RÉDACTIONNELLES DU CV :
 La Knowledge Base est une source factuelle détaillée ; le CV exige une vraie synthèse pour un recruteur.
 Le CV n'est ni un README, ni un rapport de benchmark, ni un journal d'expérimentation ou de tests, ni une publication scientifique.
 - Rédige un profil et des compétences sobres, concis, naturels et strictement appuyés par les sources locales.
-- Conserve au maximum 4 projets avec une courte description générale factuelle (idéalement une ligne)
-  expliquant ce qu'est le projet, puis de préférence 3 puces complémentaires : action, méthode, résultat ou contrainte.
+- Conserve au maximum 4 projets avec une courte description générale factuelle expliquant ce qu'est le projet.
+  Vise une phrase de 8 à 14 mots, si possible au plus 110 caractères et une ligne au rendu.
+  Raccourcis la formulation sans tronquer le sens ni réduire la police pour y parvenir.
+  Ajoute ensuite de préférence 3 puces complémentaires : action, méthode, résultat ou contrainte.
   Conserve 2 puces si les sources ne justifient pas une troisième réalisation distincte. N'invente jamais pour remplir.
   Chaque puce synthétise ce qui a été construit, le problème traité,
   la méthode ou compétence importante utilisée, ou un résultat significatif. Ne cherche pas à reprendre tous les faits disponibles.
 - Si le rendu devient trop dense, privilégie des descriptions plus concises avant de réduire le nombre de projets.
 - Conserve 4 catégories de compétences, avec 3 à 5 compétences documentées chacune, classées par pertinence décroissante
   pour l'offre puis pour le positionnement du candidat. Place les compétences explicitement demandées et les acquis
-  essentiels en tête. Conserve toutes les compétences sélectionnées.
+  essentiels en tête. Conserve toutes les compétences sélectionnées et vise une ligne concise par groupe.
   Ne supprime aucune catégorie, ni Langues ou Centres d'intérêt.
+- Sélectionne séparément dans certifications uniquement les justificatifs documentés et pertinents pour l'offre,
+  ou retourne [] si aucun ne convient. Chaque entrée contient label (organisme, type et intitulé court fidèle)
+  et year (année d'obtention attestée, sinon null). Ne fixe pas la même sélection pour toutes les offres.
+  Si le registre fourni les atteste, exemples de labels : « Microsoft Applied Skills — MCP »,
+  « Google Cloud Skills Boost — Multi-Agent Architectures (badge) »,
+  « Oracle — Agentic AI Foundations (certification de fondamentaux) ».
+  Le titre est COMPÉTENCES & CERTIFICATIONS si certifications est non vide, sinon COMPÉTENCES.
+  Le renderer ajoute une seule ligne « Certifications et badges (année) » dans cette section, jamais une section séparée.
+  Ne duplique pas les justificatifs dans skill_groups.items. Conserve les compétences techniques pertinentes.
+  Distingue certification professionnelle, certification de fondamentaux, Microsoft Applied Skills et badge pratique.
+  Un justificatif ne prouve ni tous les frameworks de son programme ni une pratique en production.
+  Utilise les périmètres et limites du registre ; ajoute ce registre à local_sources lorsqu'il est utilisé.
+  REUSE exige déjà la même sélection de justificatifs ; sinon choisis ADAPT pour adapter cette sélection à l'offre.
 - Utilise le modèle ATS A4 portrait, une seule colonne, sans tableau ni zone de texte flottante.
   Ordre : PROFIL, COMPÉTENCES, PROJETS, FORMATION, EXPÉRIENCES, LANGUES, CENTRES D'INTÉRÊT.
   Le titre est toujours PROJETS. Coordonnées et liens cliquables uniquement sur une ligne dans l'en-tête.
-  Vise une page lorsque le contenu le permet ; accepte plusieurs pages plutôt que supprimer des informations importantes.
+  Conserve une seule page A4 ; condense les formulations et évite les retours inutiles sans inventer ni supprimer de faits importants.
 - Utilise un style professionnel adapté au parcours documenté du candidat : lisible rapidement, techniquement crédible,
   sans jargon inutile, accumulation de noms techniques ou longue succession de détails séparés par des virgules.
-- Conserve une valeur numérique seulement si elle apporte une preuve utile au recruteur. Maximum une métrique
+- Chaque projet sélectionné doit comporter au moins une puce avec un résultat quantifié pertinent, exact et vérifiable.
+  Privilégie deux chiffres complémentaires si utiles, sans modifier la sélection des projets pour favoriser les chiffres.
+  Choisis selon l'offre : optimisation et temps de calcul pour la RO ; agents, outils et qualité pour l'IA agentique ;
+  généralisation, métriques et comparaisons pour le ML. Priorité : amélioration mesurée, résultat expérimental,
+  échelle du travail, puis validation technique. Maximum une métrique
   ou un groupe de métriques directement lié par puce. Arrondis naturellement : ROC-AUC 0,78 plutôt que ROC-AUC 0,7779.
-  Préfère un ordre de grandeur à un comptage exact sans signification particulière, sans modifier le sens du résultat.
-- Évite normalement les nombres de tests, seeds, cas synthétiques, fenêtres, lignes, joueurs-match, parties de benchmark,
-  checkpoints, numéros de round et échantillons intermédiaires. Exception seulement si l'échelle elle-même constitue un résultat important.
-- Un fait exact et documenté n'a aucune obligation de figurer dans le CV. Supprime les comptages de protocole :
-  les arrondir ou raccourcir le journal ne constitue pas une synthèse. Conserve exceptionnellement une échelle
-  seulement si elle est indispensable pour comprendre la valeur du travail, pas parce qu'elle est disponible dans la KB.
-- Ne fonde pas une puce sur « sans action invalide », « sans retenir de seuil opérationnel », « X/X tests réussis »,
-  « 2 cas synthétiques », « Round 1 », checkpoint/reprise, debugging, fixtures, seeds, noms internes de milestones
-  ou subtilités du protocole de test. Ces détails servent à vérifier les faits, pas à créer des accomplissements CV.
+  Conserve unités, niveau d'évaluation, split, portée locale/synthétique et conditions nécessaires à l'interprétation.
+  Ne présente jamais une loss d'entraînement comme un résultat test, ni un benchmark local comme une garantie générale.
+  N'estime et n'extrapole aucune valeur. Numéros de versions, années et milestones ne sont pas des résultats.
+  Une échelle de données n'est acceptable que comme preuve utile, en l'absence de résultat plus pertinent.
+  N'indique aucun nombre de tests réussis, de cas, de questions ou d'exemples utilisés pour une évaluation dans le CV.
+  Conserve les résultats et la portée de l'évaluation ; garde les effectifs uniquement dans les preuves internes.
+  Pour CodeAgent, privilégie Hit@5 plutôt que Hit@25, avec la comparaison et le protocole correspondants.
+  Pour MiniMind et CS2Guard, garde dans les preuves internes les précisions « sur les mêmes exemples/références locales »
+  et « au niveau joueur-match » ; ne les affiche pas dans les puces du CV.
+  Pour Kaggriculture, privilégie les gains mesurés de la lignée dérivée d'une baseline publique plutôt que le Behavioral
+  Cloning historique. Conserve la comparaison exacte : le gain face à une version précédente n'est pas un gain face à l'agent public original.
+- project_metrics contient exactement une entrée par projet, y compris REUSE. bullet recopie une puce chiffrée entière
+  du CV ; source_path figure dans local_sources ; source_quote est un extrait exact et contigu d'une SOURCE LOCALE
+  fournie, avec les valeurs et le contexte de mesure (plusieurs lignes de tableau sont possibles).
+  Les références apparaissent uniquement dans project_metrics et local_sources, jamais dans content.
+  Pour CREATE, cette même puce doit être présente dans content et reusable_content.
+  Si aucun chiffre utile n'est attesté après examen des notes et expériences, conserve le projet pertinent :
+  bullet, source_path et source_quote valent null ; missing_reason explique le manque ET propose la métrique à mesurer.
+  Sinon missing_reason vaut null. Cette exception est signalée pour validation humaine ; ne fabrique aucun chiffre.
 - N'invente aucune compétence, expérience, métrique ou réalisation. N'élargis pas la portée démontrée par les sources :
   une évaluation ne prouve pas un entraînement, une heuristique ne prouve pas une optimisation exacte,
   une expérimentation ne prouve pas une mise en production. Une omission de détail ne doit pas créer une affirmation trompeuse.
@@ -349,8 +414,8 @@ Les règles rédactionnelles ci-dessus prévalent sur les formulations des ancie
 Relis le profil, les compétences et chaque puce. Réécris tout vestige de log, compte rendu de tests,
 protocole de benchmark ou longue liste de détails techniques. Ne te limite pas à arrondir des comptages ou raccourcir des logs.
 Centre chaque puce sur le système construit, le problème traité, la méthode importante ou la valeur démontrée.
-Supprime les comptages de protocole sauf si l'échelle est exceptionnellement indispensable à cette compréhension.
-Un fait documenté peut être omis ; sa présence dans les sources ne justifie pas son inclusion dans le CV.
+Vérifie chaque projet : au moins une puce quantifiée utile et sourcée dans project_metrics, ou un manque attesté
+avec une mesure proposée pour validation humaine. Conserve les conditions indispensables, sans journal de protocole.
 """
 
 
@@ -413,7 +478,7 @@ def discovery_context(repo: Path, sources: list[str]) -> str:
 def preparation_context(
     repo: Path, offer: dict, limit: int = 10, selected_project_ids: list[str] | None = None,
 ) -> str:
-    required = knowledge_base_sources(repo)
+    required = knowledge_base_sources(repo) + [repo / "01_Career" / "Certifications.md"]
     cv_files = list((repo / "01_Career" / "CV").rglob("*.md"))
     candidates = list((repo / "01_Career").glob("*.md"))
     candidates += list((repo / "02_Projects").rglob("*.md")) + list((repo / "03_Knowledge").rglob("*.md"))
@@ -425,16 +490,16 @@ def preparation_context(
         if score:
             scored.append((score, path))
     projects = project_catalog(repo)
-    project_files = []
     if selected_project_ids is not None:
         unknown = set(selected_project_ids) - set(projects)
         if unknown:
             raise ValueError(f"Unknown projects in the KB : {', '.join(sorted(unknown))}")
-        project_files = [
-            path
-            for project_id in selected_project_ids
-            for path in sorted((repo / "02_Projects" / projects[project_id]).rglob("*.md"))
-        ]
+    # Metrics and their limitations must not depend on lexical top-N ranking or old CVs.
+    project_files = [
+        path
+        for project_id in (selected_project_ids if selected_project_ids is not None else projects)
+        for path in sorted((repo / "02_Projects" / projects[project_id]).rglob("*.md"))
+    ]
     selected = required + cv_files + project_files + [path for _, path in sorted(scored, reverse=True)[:limit]]
     context = read_context(repo, list(dict.fromkeys(selected)))
     context += "\n--- CATALOGUE CANONIQUE DES PROJETS KB ---\n" + "\n".join(
@@ -568,12 +633,13 @@ Le backend détermine l'identité, les coordonnées, l'entreprise, la date, l'ob
 Les paragraphes couvrent dans cet ordre : présentation, parcours documenté, projets pertinents, lien précis entre
 parcours/projets/poste, conclusion. Salutation et signature ne comptent pas. Maximum {COVER_LETTER_MAX_WORDS} mots pour
 le corps, compatible avec une page A4 en police 11 pt et marges 20 mm. N'inclus ni source interne, ni chemin, ni
-placeholder, ni compétence non démontrée. Le quatrième paragraphe distingue explicitement les acquis démontrés des
-domaines à approfondir dans le poste. Utilise la sélection commune cv.project_order comme contexte pour choisir les
+placeholder, ni compétence non démontrée. Le quatrième paragraphe relie les réalisations vérifiables aux missions
+précises de l'offre et à la contribution envisagée. Utilise la sélection commune cv.project_order comme contexte pour choisir les
 exemples les plus pertinents, sans énumérer systématiquement les projets. Les quatre peuvent être mentionnés si cela reste
 utile et naturel. Explicite tout nom
 interne de milestone. Adopte un ton professionnel, naturel et sobre ; évite flatterie, superlatifs, listes de technologies
 et formulations interchangeables. Vise environ 300 à {COVER_LETTER_MAX_WORDS} mots sans ajouter de contenu artificiel.
+{COVER_LETTER_WRITING_RULES}
 
 OFFRE :
 {json.dumps(offer, ensure_ascii=False)}
@@ -614,7 +680,7 @@ Réécris seulement les éléments qui nécessitent une correction de synthèse,
 Conserve les formulations déjà satisfaisantes et les faits pertinents. Le CV actuel ne constitue pas une preuve :
 chaque affirmation candidat, y compris chaque compétence, doit être appuyée par une SOURCE LOCALE fournie.
 Ne transforme aucune compétence non documentée ou exigence de l'offre en acquis candidat.
-Les références aux sources apparaissent uniquement dans local_sources, jamais dans content.
+Les références aux sources apparaissent uniquement dans local_sources et project_metrics, jamais dans content.
 {CV_WRITING_RULES}
 
 ORDRE DES PROJETS IMPOSÉ :

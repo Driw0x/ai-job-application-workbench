@@ -14,12 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.codex_workflows import CvRefreshOutput, validate_local_sources
 from app.cv_documents import create_cv, cv_project_order, cv_variants, project_catalog, validate_docx
+from app.cv_quantification import validate_cv_quantification
 from app.main import (
     DEFAULT_APPLICATIONS_ROOT, DEFAULT_DB, REPO_ROOT, add_event, connect,
     create_app, resolve_repo_path, validate_user_artifacts,
 )
 
-RULES_VERSION = "cv-layout-v3-four-projects"
+RULES_VERSION = "cv-layout-v5-certifications"
 REFRESH_STATUSES = {"SHORTLISTED", "PREPARED", "AWAITING_VALIDATION", "APPROVED", "SUBMITTING"}
 
 
@@ -129,6 +130,10 @@ def stage(app, target: dict, directory: Path) -> dict:
     create_cv(source, candidate, output.content, replace=True)
     validate_user_artifacts({}, candidate)
     selected = [project.project_id for project in output.content.projects]
+    metric_warnings = validate_cv_quantification(
+        app.state.repo_root, candidate, selected, output.project_metrics, output.local_sources,
+        {project.project_id: project.title for project in output.content.projects},
+    )
     if cv_project_order(candidate, project_catalog(app.state.repo_root)) != selected:
         raise ValueError("Refreshed resume project order differs from reviewed content")
     if fingerprint(source) != before or other_artifacts(target) != protected:
@@ -137,7 +142,7 @@ def stage(app, target: dict, directory: Path) -> dict:
         "rules_version": RULES_VERSION, "key": target["key"], "source": str(source),
         "before_sha256": before, "after_sha256": fingerprint(candidate),
         "application": target["application"], "other_artifacts": protected,
-        "project_order": selected, "output": output.model_dump(), **metadata,
+        "project_order": selected, "output": output.model_dump(), "metric_warnings": metric_warnings, **metadata,
     }
     (directory / f"{target['key']}.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return record
@@ -162,6 +167,10 @@ def apply(app, target: dict, directory: Path) -> str:
         raise ValueError("Reviewed project selection has changed")
     validate_docx(candidate)
     validate_user_artifacts({}, candidate)
+    validate_cv_quantification(
+        app.state.repo_root, candidate, selected, output.project_metrics, output.local_sources,
+        {project.project_id: project.title for project in output.content.projects},
+    )
     if fingerprint(candidate) != record["after_sha256"] or cv_project_order(candidate, project_catalog(app.state.repo_root)) != selected:
         raise ValueError("Reviewed resume has changed")
     with closing(connect(app.state.db_path)) as db:
@@ -195,7 +204,8 @@ def apply(app, target: dict, directory: Path) -> str:
                         "rules_version", "before_sha256", "after_sha256", "project_order",
                         "provider", "auth_mode", "model", "effort",
                     )
-                } | {"cv_path": row["cv_path"], "local_sources": output.local_sources}, ensure_ascii=False))
+                } | {"cv_path": row["cv_path"], "local_sources": output.local_sources,
+                     "project_metrics": [review.model_dump() for review in output.project_metrics]}, ensure_ascii=False))
             db.commit()
         except Exception:
             db.rollback()
@@ -226,15 +236,18 @@ def main() -> None:
             if args.only is not None and target["key"] not in args.only:
                 continue
             action = "planned"
+            metric_warnings = []
             if already_refreshed(app, target):
                 action = "unchanged"
             elif args.stage:
-                stage(app, target, args.stage)
+                metric_warnings = stage(app, target, args.stage)["metric_warnings"]
                 action = "staged"
             elif args.apply:
+                metric_warnings = json.loads((args.apply / f"{target['key']}.json").read_text(encoding="utf-8"))["metric_warnings"]
                 action = apply(app, target, args.apply)
             row = target["application"]
-            print(json.dumps({"key": target["key"], "status": row["status"] if row else None, "action": action}, ensure_ascii=False), flush=True)
+            print(json.dumps({"key": target["key"], "status": row["status"] if row else None,
+                              "action": action, "metric_warnings": metric_warnings}, ensure_ascii=False), flush=True)
     finally:
         if app.state.codex_client is not None:
             app.state.codex_client.close()

@@ -54,6 +54,12 @@ npm run dev -- --host 127.0.0.1
 
 Open `http://127.0.0.1:5173`. API documentation: `http://127.0.0.1:8000/docs`. Keep both services on loopback; this application has no multi-user access control.
 
+On Windows, `./start.ps1` starts both services after setup and stops both process trees on Ctrl+C.
+
+### Docker / NAS
+
+Set `KNOWLEDGE_BASE_PATH` to the host path of your private KB, then run `docker compose -f compose.nas.yml up -d --build`. The UI listens on port `8080` by default; override it with `JOB_TRACKER_PORT`. Set `PUID` and `PGID` when the NAS user is not `1000:1000`. For ChatGPT OAuth behind a NAS hostname or reverse proxy, set `CHATGPT_OAUTH_REDIRECT_URI` to the public callback URL ending in `/auth/callback`. The compose file exposes the application on the local network; use a trusted network or an authenticated reverse proxy because the app has no multi-user access control.
+
 ## Configuration and Knowledge Base
 
 Copy `.env.example` locally. Set `KNOWLEDGE_BASE_PATH` to your external KB directory, or save the directory in Search profile. The saved directory takes precedence over the environment on subsequent starts and applies to search and document generation. Select Markdown sources in the dashboard. The KB can describe your profile, skills, education, experience, projects, constraints and existing resume variants. Only documented candidate facts may be used.
@@ -72,13 +78,15 @@ For **OpenAI API**, enter an API key in provider settings, test/save it, acknowl
 
 Select the active provider/model explicitly. Stage-specific overrides and a separately enabled fallback are supported; fallback is off by default. For retrieval, configure your SearXNG instance or choose **AI_DIRECT** with a Web-capable provider. Structured relevance screening then uses the common pipeline.
 
-API keys use the operating-system keyring, service `AIJobApplicationWorkbench`; there is no plaintext fallback. ChatGPT OAuth files use `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/` on Windows or `~/.config/AIJobApplicationWorkbench/chatgpt/` otherwise. Credentials are stored locally for this application and are never committed to the repository. Logout removes local OAuth state and attempts revocation.
+API keys use the operating-system keyring, service `AIJobApplicationWorkbench`; there is no plaintext fallback. ChatGPT OAuth remains available when that keyring is unavailable. OAuth files use `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/` on Windows or `~/.config/AIJobApplicationWorkbench/chatgpt/` otherwise. Expired access tokens are refreshed once and a Codex operation is retried only when no output or tool work started. Credentials are stored locally for this application and are never committed to the repository. Logout removes local OAuth state and attempts revocation.
 
 ## Resumes, cover letters and refresh
 
 **REUSE** copies a suitable existing resume. **ADAPT** retains its project set while tailoring grounded content. **CREATE** selects four relevant grounded projects when available, otherwise only the available relevant projects (one to four); it can register a reusable variant. Never invent a fourth project. Cover-letter context uses the same selected projects, with five grounded paragraphs.
 
-Preparation and refresh use recruiter-facing natural prose, factual claims, meaningful readable metrics, no raw logs or benchmark dumps, understandable project names and a final editorial review. DOCX layout, skill balancing and validation are supported. Resume language follows the supplied template; cover-letter language follows the posting. The application UI and generated analysis/company/interview headings are English.
+Preparation and refresh use recruiter-facing natural prose, factual claims, meaningful readable metrics, no raw logs or benchmark dumps, understandable project names and a final editorial review. Every selected project must provide one quantified bullet backed by a cited local Markdown source, or an explicit measurement gap for human review. Relevant documented credentials from `01_Career/Certifications.md` can be selected per offer and rendered in the skills section without duplicating skills. DOCX layout, skill balancing and validation are supported. Resume language follows the supplied template; cover-letter language follows the posting. The application UI and generated analysis/company/interview headings are English.
+
+Cover letters keep skill gaps in the internal analysis instead of presenting defensive wording to recruiters. Unsupported technologies are omitted, semicolons and em dashes are normalized, and final DOCX validation applies the same editorial rules before replacing an existing document.
 
 Refresh eligible unsent REVIEW/SUBMIT documents without recreating the application. First inspect the dry-run, stage, review the DOCX files manually, then apply:
 
@@ -132,4 +140,4 @@ Validate every generated claim and document before use. Grounding cannot replace
 ## Documentation
 
 - [External Knowledge Base and template contract](docs/knowledge-base.md)
-- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) — Optional companion repository for reusable AI knowledge workflows.
+- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) - Optional companion repository for reusable AI knowledge workflows.

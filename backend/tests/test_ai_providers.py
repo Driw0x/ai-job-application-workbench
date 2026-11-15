@@ -12,8 +12,109 @@ from app.ai_providers import (
     AnthropicProvider, ChatGPTOAuthResponsesProvider, DeepSeekProvider, GeminiProvider,
     OpenAIProvider, WebSearchNotAllowedError, WebSearchUnsupportedModelError, _usage_metadata, _web_metadata,
 )
-from app.chatgpt_auth import ChatGPTAuth, REVOCATION_URL, TOKEN_URL
+from app.chatgpt_auth import (
+    AUTHORIZATION_URL, ChatGPTAuth, ChatGPTRefreshError, REVOCATION_URL, TOKEN_URL,
+)
 from app.codex_client import WebSearchNotExecutedError
+
+
+def test_valid_oauth_token_needs_no_refresh(tmp_path):
+    def forbidden(_):
+        raise AssertionError("Unexpected OAuth request")
+
+    auth = ChatGPTAuth(tmp_path, httpx.Client(transport=httpx.MockTransport(forbidden)))
+    auth._write("credentials.json", {
+        "access_token": "valid", "refresh_token": "refresh", "client_id": "client",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    })
+    before = (tmp_path / "credentials.json").read_bytes()
+    assert auth.access_token() == "valid"
+    assert (tmp_path / "credentials.json").read_bytes() == before
+
+
+def test_parallel_oauth_refresh_rotates_persists_and_ignores_stale_rejections(tmp_path, caplog):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "access_token": f"access-{len(requests)}",
+            "refresh_token": f"refresh-{len(requests)}", "expires_in": 3600,
+        })
+
+    auth = ChatGPTAuth(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
+    auth._write("credentials.json", {
+        "access_token": "expired", "refresh_token": "initial-refresh", "client_id": "client",
+        "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    })
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(lambda _: auth.access_token(), range(2))) == ["access-1", "access-1"]
+    assert len(requests) == 1
+    assert auth.access_token(rejected_token="expired") == "access-1"
+    assert len(requests) == 1
+    assert auth.access_token(rejected_token="access-1") == "access-2"
+    assert len(requests) == 2 and b"refresh_token=refresh-1" in requests[1].content
+    saved = auth._read("credentials.json")
+    assert saved["access_token"] == "access-2" and saved["refresh_token"] == "refresh-2"
+    assert auth.access_token(rejected_token="access-1") == "access-2" and len(requests) == 2
+    assert not any(token in caplog.text for token in [
+        "initial-refresh", "access-1", "refresh-1", "access-2", "refresh-2",
+    ])
+
+
+@pytest.mark.parametrize("status,payload,expected", [
+    (400, {"error": "invalid_grant"}, PermissionError),
+    (401, {"error": {"code": "refresh_token_invalidated"}}, PermissionError),
+    (401, {"error": "invalid_client"}, ChatGPTRefreshError),
+    (429, {"error": "rate_limit_exceeded"}, ChatGPTRefreshError),
+    (503, {"error": "service_unavailable"}, ChatGPTRefreshError),
+    (200, {"expires_in": 3600}, ChatGPTRefreshError),
+])
+def test_failed_oauth_refresh_keeps_credentials_and_classifies_cause(
+    tmp_path, status, payload, expected,
+):
+    auth = ChatGPTAuth(
+        tmp_path,
+        httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(status, json=payload))),
+    )
+    auth._write("credentials.json", {
+        "access_token": "expired", "refresh_token": "refresh", "client_id": "client",
+        "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    })
+    before = (tmp_path / "credentials.json").read_bytes()
+    with pytest.raises(expected) as captured:
+        auth.access_token()
+    if expected is ChatGPTRefreshError:
+        assert captured.value.status_code == (502 if status == 200 else status)
+        assert "Sign in again" not in str(captured.value)
+    assert (tmp_path / "credentials.json").read_bytes() == before
+
+
+def test_oauth_refresh_network_failure_is_not_session_expiration(tmp_path):
+    def unavailable(request):
+        raise httpx.ConnectError("Network unavailable", request=request)
+
+    auth = ChatGPTAuth(tmp_path, httpx.Client(transport=httpx.MockTransport(unavailable)))
+    auth._write("credentials.json", {
+        "access_token": "expired", "refresh_token": "refresh", "client_id": "client",
+        "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    })
+    with pytest.raises(httpx.ConnectError):
+        auth.access_token()
+    assert auth._read("credentials.json")["refresh_token"] == "refresh"
+
+
+def test_oauth_expiration_without_refresh_requires_reconnection(tmp_path):
+    auth = ChatGPTAuth(
+        tmp_path,
+        httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected request"))),
+    )
+    auth._write("credentials.json", {
+        "access_token": "expired",
+        "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    })
+    with pytest.raises(PermissionError, match="cannot be refreshed"):
+        auth.access_token()
 
 
 @pytest.mark.parametrize("provider_class", [ChatGPTAuth, ChatGPTOAuthResponsesProvider])
@@ -41,6 +142,15 @@ def test_sdk_client_closure_respects_factory_ownership(monkeypatch, provider_cla
     provider = provider_class("fake-key", client_factory=factory if injected else None)
     provider.close()
     assert sdk.close.call_count == (0 if injected else 1)
+
+
+def test_oauth_uses_current_openai_endpoints_and_loopback_callback(tmp_path):
+    auth = ChatGPTAuth(tmp_path)
+    url = auth.start("http://127.0.0.1:8080/auth/callback")
+    assert url.startswith(f"{AUTHORIZATION_URL}?")
+    assert TOKEN_URL == "https://auth.openai.com/api/accounts/oauth/token"
+    assert REVOCATION_URL == "https://auth.openai.com/api/accounts/oauth/revoke"
+    auth.close()
 
 
 def test_logout_waits_for_refresh_and_removes_refreshed_credentials(tmp_path):
@@ -89,6 +199,7 @@ def test_logout_waits_for_refresh_and_removes_refreshed_credentials(tmp_path):
             assert refresh.result(timeout=10) == "new-token"
             logout.result(timeout=10)
         assert len(revoked) == 1 and b"token=new-refresh" in revoked[0]
+        assert b"token_type_hint=refresh_token" in revoked[0]
         assert not (tmp_path / "credentials.json").exists()
         assert auth.status()["connected"] is False
 

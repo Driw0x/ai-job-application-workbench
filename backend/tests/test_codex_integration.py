@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zipfile import ZipFile
@@ -334,6 +335,12 @@ def cv_content(project_ids=None, generic=False):
     }
 
 
+def metric_gaps(project_ids):
+    return [{"project_id": key, "bullet": None, "source_path": None, "source_quote": None,
+             "missing_reason": "No measured result in this fixture; document retrieval quality on a held-out set."}
+            for key in project_ids]
+
+
 def preparation(action="REUSE", source_path=None, sources=None, content="default", project_ids=None):
     project_ids = project_ids if project_ids is not None else (
         ["search-prototype", "planning-prototype", "image-classifier"]
@@ -405,6 +412,7 @@ No interview scheduled yet.
                "target_filename": "CV_Example_Stage_IA.docx" if action != "REUSE" else None,
                "justification": "Choix fondé sur les preuves locales.", "changes": [], "missing_fit": [],
                "project_set": project_ids, "project_order": project_ids,
+               "project_metrics": metric_gaps(project_ids),
                "content": generated_content,
                "reusable_content": cv_content(project_ids, generic=True) if action == "CREATE" else None},
     }
@@ -779,10 +787,13 @@ def test_manual_company_address_overrides_future_preparation(tmp_path):
     assert "99 rue Manuelle" in document_text(folder / "lettre-motivation.docx")
 
 
-def test_auth_connection_success(tmp_path):
+def test_auth_connection_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHATGPT_OAUTH_REDIRECT_URI", "http://127.0.0.1:8080/auth/callback")
     auth = FakeAuth(False)
     api, _ = client(tmp_path, auth=auth)
-    assert api.get("/auth/chatgpt/start").json()["authorization_url"].startswith("https://auth.openai.test/")
+    assert api.get("/auth/chatgpt/start").json()["authorization_url"] == (
+        "https://auth.openai.test/?redirect_uri=http://127.0.0.1:8080/auth/callback"
+    )
     assert api.get("/auth/chatgpt/callback?code=x&state=y&client_id=z").status_code == 200
     assert api.get("/auth/chatgpt/status").json()["connected"] is True
 
@@ -823,10 +834,119 @@ def test_discovery_uses_searxng_then_codex_without_ai_web_search(tmp_path):
 
 
 def test_revoked_token(tmp_path):
-    auth = ChatGPTAuth(tmp_path, httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(400))))
+    auth = ChatGPTAuth(tmp_path, httpx.Client(transport=httpx.MockTransport(
+        lambda _: httpx.Response(400, json={"error": "invalid_grant"}),
+    )))
     auth._write("credentials.json", {"access_token": "old", "refresh_token": "refresh", "client_id": "client",
                                       "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()})
     with pytest.raises(PermissionError): auth.access_token()
+
+
+def oauth_client(tmp_path, factory, handler, repo_root=None):
+    auth = ChatGPTAuth(tmp_path / "auth", httpx.Client(transport=httpx.MockTransport(handler)))
+    auth._write("credentials.json", {
+        "access_token": "old-access", "refresh_token": "old-refresh", "client_id": "test-client",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    })
+    app = create_app(
+        tmp_path / "tracker.db", tmp_path / "applications", auth, factory,
+        repo_root=repo_root or CV_ROOT.parents[2],
+    )
+    api = TestClient(app)
+    assert api.put("/codex/model", json={"model": "test-model"}).status_code == 200
+    return api, app, auth
+
+
+def test_oauth_new_token_replaces_cached_client_without_interrupting_active_use(tmp_path):
+    started, release = threading.Event(), threading.Event()
+    clients, refreshes = [], []
+
+    class TokenClient(FakeCodex):
+        hold = False
+        closed = False
+
+        def models(self):
+            if self.hold:
+                started.set()
+                assert release.wait(10)
+                assert not self.closed
+            return super().models()
+
+        def close(self):
+            self.closed = True
+
+    def factory(token):
+        value = TokenClient()
+        value.token = token
+        clients.append(value)
+        return value
+
+    def refresh(request):
+        refreshes.append(request)
+        return httpx.Response(200, json={
+            "access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600,
+        })
+
+    api, app, auth = oauth_client(tmp_path, factory, refresh)
+    clients[0].hold = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        active = pool.submit(api.get, "/codex/models")
+        try:
+            assert started.wait(5)
+            credentials = auth._read("credentials.json")
+            credentials["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            auth._write("credentials.json", credentials)
+            assert api.get("/codex/models").status_code == 200
+            assert [value.token for value in clients] == ["old-access", "new-access"]
+            assert not clients[0].closed
+        finally:
+            release.set()
+        assert active.result(timeout=10).status_code == 200
+    assert clients[0].closed and not clients[1].closed
+    assert api.get("/codex/models").status_code == 200 and len(clients) == 2
+    assert len(refreshes) == 1 and not app.state.codex_client_users
+    assert auth._read("credentials.json")["refresh_token"] == "new-refresh"
+    assert api.post("/auth/chatgpt/logout").status_code == 200
+    assert clients[1].closed
+
+
+def test_oauth_retries_expired_token_once_before_any_output(tmp_path):
+    clients, refreshes = [], []
+
+    class TokenClient(FakeCodex):
+        def run(self, *args, **kwargs):
+            if self.token == "old-access":
+                self.calls += 1
+                raise CodexError("401 Unauthorized: token_expired", retry_safe=True)
+            return super().run(*args, **kwargs)
+
+    def factory(token):
+        value = TokenClient(discovery())
+        value.token = token
+        clients.append(value)
+        return value
+
+    def refresh(request):
+        refreshes.append(request)
+        return httpx.Response(200, json={
+            "access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600,
+        })
+
+    auth = ChatGPTAuth(tmp_path / "auth", httpx.Client(transport=httpx.MockTransport(refresh)))
+    auth._write("credentials.json", {
+        "access_token": "old-access", "refresh_token": "old-refresh", "client_id": "test-client",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    })
+    app = create_app(
+        tmp_path / "tracker.db", tmp_path / "applications", auth, factory,
+        search_provider_factory=lambda _: FakeSearchProvider(),
+    )
+    api = TestClient(app)
+    assert api.put("/codex/model", json={"model": "test-model"}).status_code == 200
+    assert api.post("/codex/discover").status_code == 200
+    assert [value.token for value in clients] == ["old-access", "new-access"]
+    assert sum(value.calls for value in clients) == 2
+    assert len(refreshes) == 1
 
 
 def test_no_credential_exposed_to_frontend(tmp_path):
@@ -1288,6 +1408,25 @@ def test_api_key_lifecycle_never_returns_or_writes_secret_to_sqlite(tmp_path, ca
     assert api.delete(f"/ai/api-keys/{provider_id}").json() == {"configured": False}
     assert store.get(provider_id) is None
     assert secret not in caplog.text and replacement not in caplog.text
+
+
+def test_ai_config_keeps_chatgpt_available_without_system_keyring(tmp_path):
+    class UnavailableKeyStore:
+        def get(self, _provider):
+            raise RuntimeError("keyring unavailable")
+
+        def set(self, _provider, _value):
+            raise RuntimeError("keyring unavailable")
+
+    api = TestClient(create_app(
+        tmp_path / "tracker.db", tmp_path / "applications", FakeAuth(False),
+        api_key_store=UnavailableKeyStore(),
+    ))
+    response = api.get("/ai/config")
+    assert response.status_code == 200
+    assert response.json()["chatgpt"]["connected"] is False
+    assert all(not item["configured"] for item in response.json()["api_keys"].values())
+    assert api.put("/ai/api-keys/openai", json={"api_key": "sk-never-stored-secret"}).status_code == 502
 
 
 @pytest.mark.parametrize("provider_id", ["openai", "anthropic_api", "gemini_api", "deepseek_api"])
@@ -2140,6 +2279,33 @@ def test_prepare_adapt_replaces_partial_cv_from_failed_attempt(tmp_path):
     assert_valid_docx(stale)
 
 
+@pytest.mark.parametrize("action", ["REUSE", "ADAPT", "CREATE"])
+def test_preparation_retry_keeps_unregistered_cv_filename(tmp_path, action, monkeypatch):
+    repo = isolated_repo(tmp_path, with_variants=action != "CREATE")
+    payload = preparation(action)
+    api, app = client(tmp_path, payload, repo_root=repo)
+    application_id = shortlist(api)
+    import app.main as main
+
+    def fail_after_cv(*args, **kwargs):
+        raise ValueError("Failure after resume generation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(main, "validate_user_artifacts", fail_after_cv)
+        assert api.post(f"/applications/{application_id}/prepare-with-codex").status_code == 200
+        failed = wait_for_preparation(api, application_id, "failed")
+    assert failed["cv_path"] is None
+    existing, = (tmp_path / "applications").rglob("cv/*.docx")
+    payload["cv"]["target_filename"] = "resume_new_attempt.docx"
+
+    assert api.post(f"/applications/{application_id}/prepare-with-codex").status_code == 200
+    prepared = wait_for_preparation(api, application_id, "completed")
+
+    assert Path(prepared["cv_path"]) == existing
+    assert list(existing.parent.glob("*.docx")) == [existing]
+    assert prepared["artifacts"] == {"complete": True, "missing": [], "invalid": []}
+
+
 def test_prepare_create_uses_template_and_registers_new_global_variant(tmp_path):
     repo = isolated_repo(tmp_path)
     generated_root = repo / "01_Career/CV/Generated"
@@ -2278,6 +2444,7 @@ def test_prepare_accepts_targeted_project_title_for_selected_project_id(tmp_path
     project_id = "network-planning-experiment"
     payload["cv"]["project_set"][2] = project_id
     payload["cv"]["project_order"][2] = project_id
+    payload["cv"]["project_metrics"] = metric_gaps(payload["cv"]["project_order"])
     for content in (payload["cv"]["content"], payload["cv"]["reusable_content"]):
         content["projects"][2]["project_id"] = project_id
         content["projects"][2]["title"] = "Network Planning Experiment – Allocation sous contraintes"
@@ -2309,6 +2476,7 @@ def test_create_new_set_is_reused_without_duplicate_variant(tmp_path):
     second["cv"]["source_variant"] = "A"
     second["cv"]["project_set"] = ids
     second["cv"]["project_order"] = list(reversed(ids))
+    second["cv"]["project_metrics"] = metric_gaps(ids)
     second["cv"]["content"] = cv_content(list(reversed(ids)))
     app.state.fake_codex.response = second
     created = api.post("/applications", json={

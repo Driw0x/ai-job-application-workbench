@@ -14,7 +14,7 @@ from app.cover_letters import (
     migrate_cover_letter_docx, read_cover_letter_docx,
     missing_optional_cover_letter_values,
     replace_in_runs, validate_cover_letter_docx,
-    validate_cover_letter_template,
+    validate_cover_letter_template, validate_cover_letter_writing,
 )
 from app.main import REPO_ROOT
 from scripts.migrate_cover_letters import migrate_all
@@ -84,6 +84,12 @@ def test_failed_markdown_migration_preserves_source(tmp_path: Path) -> None:
 
 def test_real_template_respects_contract() -> None:
     validate_cover_letter_template(cover_letter_template_path(REPO_ROOT))
+
+
+@pytest.mark.parametrize("punctuation", (";", "—"))
+def test_cover_letter_rejects_forbidden_punctuation(punctuation: str) -> None:
+    with pytest.raises(CoverLetterError, match="forbidden"):
+        validate_cover_letter_writing(f"A sentence{punctuation} followed by another.")
 
 
 def test_real_profile_provides_structured_candidate_contact() -> None:
@@ -394,3 +400,50 @@ def test_international_company_postal_blocks(address, street, postal):
     assert valid_postal_address(address)
     assert split_postal_address(address) == (street, postal)
     assert not valid_postal_address("123 Example Street\nExample City")
+
+
+@pytest.mark.parametrize("sentence", (
+    "Microsoft Copilot reste un environnement à approfondir.",
+    "Je n'ai pas encore eu l'occasion d'utiliser Azure AI.",
+    "Je n’ai pas encore eu l’occasion d’utiliser Azure AI.",
+    "Bien que je ne maîtrise pas Copilot Studio, je pratique Python.",
+    "Je souhaite développer mes compétences sur Azure AI.",
+    "Mon expérience dans ce domaine est limitée.",
+    "Ces domaines ne sont pas encore démontrés dans mes projets.",
+    "Ces projets ne constituent pas une expérience de déploiement.",
+    "I have not used Copilot Studio yet.",
+    "I would need to learn Azure AI during the internship.",
+    "My experience with these tools is limited.",
+))
+def test_skill_gap_wording_is_rejected_before_overwriting_letter(tmp_path: Path, sentence: str) -> None:
+    path = tmp_path / "cover-letter.docx"
+    path.write_bytes(b"Existing manual edits")
+    paragraphs = ["My Python project prepares data." for _ in range(5)]
+    paragraphs[3] = sentence
+
+    with pytest.raises(CoverLetterError, match="skill-gap"):
+        create_cover_letter_docx(REPO_ROOT, path, "Example", "AI internship", None, paragraphs)
+
+    assert path.read_bytes() == b"Existing manual edits"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("sentence", (
+    "J’ai évalué le RAG de CodeAgent sur des corpus internes de code Python.",
+    "Mes réalisations concernent des prototypes locaux et une évaluation offline.",
+    "J’ai comparé des modèles supervisés et non supervisés dans CS2Guard.",
+    "I evaluated source-grounded retrieval on internal Python code corpora.",
+))
+def test_positive_project_scope_is_preserved(sentence: str) -> None:
+    validate_cover_letter_writing(sentence)
+
+
+def test_final_docx_validation_checks_editorial_content(tmp_path: Path) -> None:
+    path = tmp_path / "letter.docx"
+    legacy_letter(path)
+    document = Document(path)
+    document.paragraphs[6].text = "I would need to learn Azure AI during the internship."
+    document.save(path)
+
+    with pytest.raises(CoverLetterError, match="skill-gap"):
+        validate_cover_letter_docx(path)

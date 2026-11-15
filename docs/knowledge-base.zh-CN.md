@@ -14,6 +14,7 @@ candidate-knowledge-base/
     Profile.md
     Domains.md
     Job Search.md
+    Certifications.md
     CV/
       Templates/resume-template.docx
       Generated/resume_A.docx
@@ -42,18 +43,20 @@ candidate-knowledge-base/
 
 `02_Projects` 下的目录定义规范项目标识。每个项目都应有事实性 Markdown 证据。来源充分时选择四个不同的相关项目，宁可少用，也不编造。自定义提示词发现仅使用保存的搜索条件，不使用此知识库。简历/求职信准备仍需要候选人证据和模板。
 
+`01_Career/Certifications.md` 为可选文件。存在时，应记录每项证书或徽章的颁发机构、日期、类型、URL、考核范围及限制。模型只按职位选择相关凭证，不会把徽章或基础认证当作生产经验的证明。
+
 ## 简历模板
 
 提供自己的 `01_Career/CV/Templates/resume-template.docx`。不附带个人模板。如果 `Templates` 中恰好只有一个使用其他文件名的 DOCX，会自动选择该文件。存在多个模板时，使用首选文件名明确指定。渲染器兼容旧双栏模板和 ATS 模板。前三段分别为姓名、学历和个性化标题，随后为联系信息。所有输出统一使用 A4 纵向、单栏、Arial 字体，不使用表格或浮动文本框。栏目顺序为 `PROFIL`、`COMPÉTENCES`、`PROJETS`、`FORMATION`、`EXPÉRIENCES`、`LANGUES`、`CENTRES D'INTÉRÊT`。兼容旧英文及法文标题；没有事实依据的栏目不会编造。
 
-保留身份、联系方式、教育及其他静态事实。技能分四组，每组三至五项，紧凑排列。新项目包含标题、技术、说明和两至三条要点。REUSE 保留内容并应用 ATS 格式；ADAPT 和 CREATE 根据事实进行个性化。可点击链接仅集中在顶部联系信息行。不会为了强制一页而删除内容；最终 Word/PDF 分页需要人工审核。
+保留身份、联系方式、教育及其他静态事实。技能分四组，每组三至五项，紧凑排列。选中的凭证会在 `COMPÉTENCES & CERTIFICATIONS` 下增加一行；未选择凭证时保留原 `COMPÉTENCES` 标题。新项目包含标题、技术、说明和两至三条要点。每个选中项目必须包含一条有用的量化要点，并由已引用的项目或知识笔记支持。如果没有已记录的可用指标，系统保留该项目并把缺失的测量项交给人工审核。REUSE 保留内容并应用 ATS 格式；ADAPT 和 CREATE 根据事实进行个性化。可点击链接仅集中在顶部联系信息行。不会为了强制一页而删除内容；最终 Word/PDF 分页需要人工审核。
 
 ## 简历版本与刷新
 
 生成文件使用 `resume_A.docx`、`resume_B.docx` 等名称，也兼容唯一的旧 `*_A.docx` 文件。`CV_Variants.md` 将版本映射到一至四个不同且精确匹配的项目目录名：
 
 ```markdown
-## Variant A — General profile
+## Variant A - General profile
 
 Projects :
 

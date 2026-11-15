@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -12,9 +13,21 @@ from urllib.parse import urlsplit
 
 
 class CodexError(RuntimeError):
-    def __init__(self, message: str, *, metadata: dict[str, Any] | None = None) -> None:
+    def __init__(self, message: str, *, metadata: dict[str, Any] | None = None,
+                 retry_safe: bool = False) -> None:
         super().__init__(message)
         self.metadata = metadata or {}
+        self.token_expired = bool(re.search(r"\btoken_expired\b", message))
+        status = re.search(r"\b(401 Unauthorized|403 Forbidden|429 Too Many Requests)\b", message)
+        structured_status = re.search(r"httpStatusCode['\"]?\s*:\s*(401|403|429)\b", message)
+        self.status_code = None
+        if self.token_expired:
+            self.status_code = 401
+        elif status:
+            self.status_code = int(status.group(0)[:3])
+        elif structured_status:
+            self.status_code = int(structured_status.group(1))
+        self.retry_safe = retry_safe
 
 
 class CodexStructuredOutputError(CodexError):
@@ -174,7 +187,8 @@ class CodexClient:
                 detail = self.errors[-1] if self.errors else f"Timeout during {method}"
                 raise CodexError(detail) from error
             if "error" in message:
-                raise CodexError(str(message["error"].get("message", message["error"])))
+                raise CodexError(str(message["error"].get("message", message["error"])),
+                                 retry_safe=method in {"thread/start", "turn/start"})
             return message.get("result", {})
         finally:
             with self.lock:
@@ -224,6 +238,7 @@ class CodexClient:
             deltas: dict[str, list[str]] = {}
             item_order: list[str] = []
             web_items: list[dict[str, Any]] = []
+            work_started = False
             turn: dict[str, Any] = {}
             while True:
                 try:
@@ -231,6 +246,8 @@ class CodexClient:
                 except queue.Empty as error:
                     raise CodexError("Codex turn timed out") from error
                 method, params = message.get("method"), message.get("params", {})
+                if method in {"item/started", "item/completed"}:
+                    work_started = True
                 if method == "thread/tokenUsage/updated":
                     usage = params.get("tokenUsage") or {}
                     if isinstance(usage, dict) and isinstance(usage.get("total"), dict):
@@ -270,7 +287,12 @@ class CodexClient:
         if not any(key in metadata for key in ("input_tokens", "output_tokens", "total_tokens")):
             metadata.update(_token_metadata(usage))
         if turn.get("status") != "completed":
-            raise CodexError(str(turn.get("error") or "Codex turn failed"), metadata=metadata)
+            retry_safe = (
+                turn.get("status") == "failed" and not work_started and not any(deltas.values())
+                and not turn.get("items") and not metadata.get("output_tokens")
+            )
+            raise CodexError(str(turn.get("error") or "Codex turn failed"),
+                             metadata=metadata, retry_safe=retry_safe)
         if web_search and not web_items:
             raise WebSearchNotExecutedError("Web search not executed by the provider", metadata=metadata)
         text = final_agent_text(turn, deltas, item_order)

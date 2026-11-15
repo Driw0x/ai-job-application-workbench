@@ -13,14 +13,20 @@ from urllib.parse import urlencode
 import httpx
 import jwt
 
-AUTHORIZATION_URL = "https://auth.openai.com/oauth/authorize"
-TOKEN_URL = "https://auth.openai.com/oauth/token"
-REVOCATION_URL = "https://auth.openai.com/oauth/revoke"
+AUTHORIZATION_URL = "https://auth.openai.com/api/accounts/authorize"
+TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
+REVOCATION_URL = "https://auth.openai.com/api/accounts/oauth/revoke"
 JWKS_URL = "https://auth.openai.com/.well-known/jwks.json"
 ISSUER = "https://auth.openai.com"
 RESOURCE = "https://api.openai.com/v1"
 SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
 DYNAMIC_CLIENT_ID = "dynamic_agent_client"
+
+
+class ChatGPTRefreshError(RuntimeError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _utcnow() -> datetime:
@@ -114,32 +120,50 @@ class ChatGPTAuth:
         if "chatgpt.tokens.use.direct" not in scopes:
             raise PermissionError("ChatGPT quota consent refused")
         expires_at = (_utcnow() + timedelta(seconds=int(tokens.get("expires_in", 0)))).isoformat()
-        self._write("credentials.json", {**tokens, "client_id": client_id, "expires_at": expires_at,
-                                         "email": claims.get("email"), "subject": claims.get("sub")})
-        registration = self._read("registration.json")
-        registration.update({"client_id": client_id, "email": claims.get("email"), "subject": claims.get("sub")})
-        self._write("registration.json", registration)
+        with self.lock:
+            self._write("credentials.json", {**tokens, "client_id": client_id, "expires_at": expires_at,
+                                             "email": claims.get("email"), "subject": claims.get("sub")})
+            registration = self._read("registration.json")
+            registration.update({"client_id": client_id, "email": claims.get("email"), "subject": claims.get("sub")})
+            self._write("registration.json", registration)
 
     def status(self) -> dict:
         credentials = self._read("credentials.json")
         return {"connected": bool(credentials.get("refresh_token") or credentials.get("access_token")),
                 "account": credentials.get("email")}
 
-    def access_token(self) -> str:
+    def access_token(self, *, rejected_token: str | None = None) -> str:
         with self.lock:
             credentials = self._read("credentials.json")
             if not credentials:
                 raise PermissionError("ChatGPT is not connected")
             expiry = datetime.fromisoformat(credentials["expires_at"])
-            if expiry > _utcnow() + timedelta(seconds=60):
+            if (expiry > _utcnow() + timedelta(seconds=60)
+                    and credentials.get("access_token")
+                    and credentials["access_token"] != rejected_token):
                 return credentials["access_token"]
+            if not credentials.get("refresh_token"):
+                raise PermissionError("ChatGPT session cannot be refreshed. Sign in again.")
             response = self.http.post(TOKEN_URL, data={
                 "grant_type": "refresh_token", "refresh_token": credentials["refresh_token"],
                 "client_id": credentials["client_id"], "resource": RESOURCE,
             })
             if response.status_code >= 400:
-                raise PermissionError("ChatGPT session expired or revoked. Sign in again.")
+                try:
+                    payload = response.json().get("error", "")
+                    code = payload.get("code", "") if isinstance(payload, dict) else payload
+                except (ValueError, AttributeError):
+                    code = ""
+                if code in {"invalid_grant", "invalid_refresh_token", "refresh_token_expired",
+                            "refresh_token_reused", "refresh_token_invalidated"}:
+                    raise PermissionError("ChatGPT session expired or revoked. Sign in again.")
+                raise ChatGPTRefreshError(
+                    f"ChatGPT token refresh refused (HTTP {response.status_code}).",
+                    response.status_code,
+                )
             refreshed = response.json()
+            if not refreshed.get("access_token") or int(refreshed.get("expires_in", 0)) <= 0:
+                raise ChatGPTRefreshError("Invalid ChatGPT token refresh response.", 502)
             credentials.update(refreshed)
             credentials["expires_at"] = (_utcnow() + timedelta(seconds=int(refreshed.get("expires_in", 0)))).isoformat()
             self._write("credentials.json", credentials)
@@ -151,7 +175,11 @@ class ChatGPTAuth:
             token = credentials.get("refresh_token")
             if token:
                 try:
-                    self.http.post(REVOCATION_URL, data={"token": token, "client_id": credentials.get("client_id")})
+                    self.http.post(REVOCATION_URL, data={
+                        "token": token,
+                        "token_type_hint": "refresh_token",
+                        "client_id": credentials.get("client_id"),
+                    })
                 except httpx.HTTPError:
                     pass
             path = self.store / "credentials.json"

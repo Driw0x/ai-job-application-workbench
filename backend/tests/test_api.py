@@ -875,14 +875,14 @@ def test_ignored_offer_can_be_restored_without_codex_or_data_loss(tmp_path: Path
     assert not applications_root.exists()
 
 
-def test_withdrawn_and_ignored_cleanup_generated_documents_only(tmp_path: Path) -> None:
+def test_closed_and_ignored_cleanup_generated_documents_only(tmp_path: Path) -> None:
     database = tmp_path / "test.db"
     applications_root = tmp_path / "Applications"
     api = TestClient(create_app(database, applications_root, repo_root=tmp_path))
     template = tmp_path / "CV-template.docx"
     template.write_bytes(b"source template")
 
-    for index, target in enumerate(("WITHDRAWN", "IGNORED")):
+    for index, target in enumerate(("REJECTED", "WITHDRAWN", "NO_RESPONSE", "IGNORED")):
         application_id = create(api, f"https://example.com/cleanup/{index}")["id"]
         complete_preparation(database, applications_root, application_id)
         folder = applications_root / f"example-company-stage-ia-{application_id}"
@@ -891,7 +891,7 @@ def test_withdrawn_and_ignored_cleanup_generated_documents_only(tmp_path: Path) 
         cv.with_suffix(".pdf").write_bytes(b"%PDF cv")
         cv.with_name("CV-copy.docx").write_bytes(b"generated copy")
         letter.with_suffix(".pdf").write_bytes(b"%PDF letter")
-        if target == "WITHDRAWN":
+        if target != "IGNORED":
             with connect(database) as db:
                 db.execute("UPDATE applications SET status='SENT' WHERE id=?", (application_id,))
                 db.commit()

@@ -25,6 +25,58 @@ class FakeProcess:
     def kill(self): self.terminated = True
 
 
+@pytest.mark.parametrize("items,delta,output_tokens,streamed_item,safe", [
+    ([], "", 0, False, True),
+    ([{"type": "agentMessage", "text": "partial"}], "", 0, False, False),
+    ([{"type": "commandExecution"}], "", 0, False, False),
+    ([], "partial", 0, False, False),
+    ([], "", 5, False, False),
+    ([], "", 0, True, False),
+])
+def test_expired_turn_is_retryable_only_before_output_or_tool_work(
+    monkeypatch, tmp_path, items, delta, output_tokens, streamed_item, safe,
+):
+    process = FakeProcess()
+    monkeypatch.setattr(codex_client.shutil, "which", lambda _: r"C:\Tools\codex.exe")
+    monkeypatch.setattr(codex_client.subprocess, "Popen", lambda *_args, **_kwargs: process)
+
+    def request(self, method, params):
+        if method == "thread/start":
+            return {"thread": {"id": "expired-thread"}}
+        if method == "turn/start":
+            messages = self.notifications["expired-thread"]
+            if streamed_item:
+                messages.put({"method": "item/completed", "params": {"item": {"type": "commandExecution"}}})
+            if delta:
+                messages.put({"method": "item/agentMessage/delta", "params": {"delta": delta}})
+            messages.put({"method": "turn/completed", "params": {"turn": {
+                "status": "failed", "items": items, "usage": {"output_tokens": output_tokens},
+                "error": {"message": "401 Unauthorized", "code": "token_expired"},
+            }}})
+        return {}
+
+    monkeypatch.setattr(CodexClient, "_request", request)
+    monkeypatch.setattr(CodexClient, "_send", lambda *_: None)
+    with CodexClient("fake", tmp_path) as client:
+        with pytest.raises(CodexError) as captured:
+            client.run("prompt", "test-model", {})
+    assert captured.value.token_expired and captured.value.status_code == 401
+    assert captured.value.retry_safe is safe
+
+
+@pytest.mark.parametrize("message,status,expired", [
+    ("401 Unauthorized: invalid_token", 401, False),
+    ("401 Unauthorized: token_expired", 401, True),
+    ("403 Forbidden", 403, False),
+    ("429 Too Many Requests", 429, False),
+    ("{'httpStatusCode': 401, 'message': 'not authorized'}", 401, False),
+    ("network failure", None, False),
+])
+def test_codex_error_distinguishes_expiration_from_other_failures(message, status, expired):
+    error = CodexError(message)
+    assert error.status_code == status and error.token_expired is expired
+
+
 def test_codex_absent(monkeypatch):
     monkeypatch.setattr(codex_client.shutil, "which", lambda _: None)
     with pytest.raises(CodexError, match="Codex CLI not found in PATH"):

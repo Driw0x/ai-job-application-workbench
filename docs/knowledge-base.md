@@ -14,6 +14,7 @@ candidate-knowledge-base/
     Profile.md
     Domains.md
     Job Search.md
+    Certifications.md
     CV/
       Templates/resume-template.docx
       Generated/resume_A.docx
@@ -42,18 +43,20 @@ Document actual background, skills, constraints and project outcomes. The follow
 
 Project directories under `02_Projects` define canonical project identifiers. Give each project factual Markdown evidence. Select four relevant distinct projects when available; use fewer rather than inventing facts. Custom-prompt discovery uses only its saved search criteria, without this KB. Resume/letter preparation still needs candidate evidence and templates.
 
+`01_Career/Certifications.md` is optional. When present, document each credential, issuer, date, type, URL, assessed scope and limits. The model selects only relevant credentials for each offer. It does not treat a badge or foundational credential as proof of production experience.
+
 ## Resume template
 
 Supply your own `01_Career/CV/Templates/resume-template.docx`. No personal template is bundled. If `Templates` contains exactly one DOCX with a different filename, it is selected automatically. When multiple templates exist, use the preferred filename to select one unambiguously. The renderer accepts legacy two-column and ATS templates. The first three paragraphs contain the name, education and personalized headline; contact details follow. All outputs use the same ATS layout: A4 portrait, one column, Arial, no tables or floating text boxes. Sections follow `PROFIL`, `COMPÉTENCES`, `PROJETS`, `FORMATION`, `EXPÉRIENCES`, `LANGUES`, `CENTRES D'INTÉRÊT`. Legacy English and French headings are accepted. Sections without documented facts are not invented.
 
-Identity, contacts, education and other static facts are retained. Skills have four groups of three to five entries, displayed as compact lines. New projects have a title, technologies, description and two to three bullets. REUSE retains content and applies ATS formatting; ADAPT and CREATE personalize documented facts. Clickable links appear with contact details in the header only. Content is never removed to force one page; final Word/PDF pagination needs human review.
+Identity, contacts, education and other static facts are retained. Skills have four groups of three to five entries, displayed as compact lines. Selected credentials appear on one additional line under `COMPÉTENCES & CERTIFICATIONS`; an empty selection keeps the original `COMPÉTENCES` heading. New projects have a title, technologies, description and two to three bullets. Each selected project must include one useful quantified bullet supported by a cited project or knowledge note. If no useful metric is documented, generation keeps the project and reports the missing measurement for human review. REUSE retains content and applies ATS formatting; ADAPT and CREATE personalize documented facts. Clickable links appear with contact details in the header only. Content is never removed to force one page; final Word/PDF pagination needs human review.
 
 ## Variants and refresh
 
 Generated files use `resume_A.docx`, `resume_B.docx`, etc. A unique legacy `*_A.docx` also works. `CV_Variants.md` maps a variant to one to four distinct exact project directory names:
 
 ```markdown
-## Variant A — General profile
+## Variant A - General profile
 
 Projects :
 

@@ -23,7 +23,7 @@ from app.main import add_event, connect
 from scripts import migrate_ats_cvs, refresh_cvs
 from test_codex_integration import (
     FakeApiProvider, FakeKeyStore, FakeProviderError, assert_no_source_leak, client, cv_content, isolated_repo,
-    preparation, shortlist, wait_for_preparation,
+    preparation, shortlist, wait_for_preparation, metric_gaps,
 )
 
 
@@ -219,7 +219,7 @@ def prepared_application(tmp_path, request):
     application_id = shortlist(api)
     assert api.post(f"/applications/{application_id}/prepare-with-codex").status_code == 200
     application = wait_for_preparation(api, application_id, "completed")
-    payload = {"content": cv_content(project_ids), "local_sources": sources}
+    payload = {"content": cv_content(project_ids), "local_sources": sources, "project_metrics": metric_gaps(project_ids)}
     payload["content"]["projects"][0]["bullets"][0] = "Développé un outil pour explorer des sources documentées."
     app.state.fake_codex.response = payload
     return api, app, application_id, Path(application["cv_path"])
@@ -252,7 +252,8 @@ def test_cv_output_schemas_allow_one_to_four_projects(model):
     for count in range(1, 5):
         payload = preparation("CREATE", project_ids=PROJECT_IDS[:count])
         if model is CvRefreshOutput:
-            payload = {"content": payload["cv"]["content"], "local_sources": payload["local_sources"]}
+            payload = {"content": payload["cv"]["content"], "local_sources": payload["local_sources"],
+                       "project_metrics": payload["cv"]["project_metrics"]}
         model.model_validate(payload)
 
 
@@ -261,7 +262,8 @@ def test_cv_output_schemas_allow_one_to_four_projects(model):
 def test_cv_outputs_reject_project_counts_outside_one_to_four(model, count):
     payload = preparation("CREATE", project_ids=PROJECT_IDS[:count])
     if model is CvRefreshOutput:
-        payload = {"content": payload["cv"]["content"], "local_sources": payload["local_sources"]}
+        payload = {"content": payload["cv"]["content"], "local_sources": payload["local_sources"],
+                   "project_metrics": payload["cv"]["project_metrics"]}
     with pytest.raises(ValidationError):
         model.model_validate(payload)
 
@@ -310,7 +312,7 @@ def test_cv_prompts_share_writing_rules_and_fixed_refresh_projects():
     assert CV_WRITING_RULES in preparation_prompt(offer, "facts")
     assert preparation_prompt(offer, "facts").endswith(CV_FINAL_REVIEW)
     for instruction in (
-        "ni un README", "Maximum une métrique", "ROC-AUC 0,78", "Ne fonde pas une puce",
+        "ni un README", "Maximum une métrique", "ROC-AUC 0,78", "Chaque projet sélectionné",
         "N'invente aucune compétence", "3 puces complémentaires",
     ):
         assert instruction in CV_WRITING_RULES
@@ -679,6 +681,7 @@ def test_refresh_expands_legacy_three_projects_with_grounded_fourth(prepared_app
     protected = refresh_cvs.other_artifacts(target)
     payload = app.state.fake_codex.response
     payload["content"] = cv_content(PROJECT_IDS[:4])
+    payload["project_metrics"] = metric_gaps(PROJECT_IDS[:4])
     payload["local_sources"].append("02_Projects/Planning Prototype/Planning Prototype.md")
     directory = tmp_path / "reviewed-four"
     record = refresh_cvs.stage(app, target, directory)

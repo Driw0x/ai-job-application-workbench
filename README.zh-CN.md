@@ -54,6 +54,12 @@ npm run dev -- --host 127.0.0.1
 
 打开 `http://127.0.0.1:5173`。API 文档位于 `http://127.0.0.1:8000/docs`。两个服务均应绑定回环地址；应用没有多用户访问控制。
 
+在 Windows 上，完成安装后可运行 `./start.ps1` 同时启动两个服务，并用 Ctrl+C 停止其进程树。
+
+### Docker / NAS
+
+将 `KNOWLEDGE_BASE_PATH` 设置为私有知识库在主机上的路径，然后运行 `docker compose -f compose.nas.yml up -d --build`。界面默认使用端口 `8080`，可通过 `JOB_TRACKER_PORT` 修改。如果 NAS 用户不是 `1000:1000`，请设置 `PUID` 和 `PGID`。若 ChatGPT OAuth 位于 NAS 主机名或反向代理之后，请把 `CHATGPT_OAUTH_REDIRECT_URI` 设置为以 `/auth/callback` 结尾的公开回调 URL。Compose 文件会在局域网中公开应用；本应用没有多用户访问控制，因此仅应在可信网络或带身份验证的反向代理后使用。
+
 ## 配置与知识库
 
 在本地复制 `.env.example`。将 `KNOWLEDGE_BASE_PATH` 设置为外部知识库目录，或在 Search profile 中保存目录。保存的目录在后续启动时优先于环境变量，并同时用于搜索和文档生成。在控制面板选择 Markdown 来源。知识库可包含个人资料、技能、教育、经历、项目、约束及已有简历版本。只使用有来源支持的候选人事实。
@@ -72,13 +78,15 @@ npm run dev -- --host 127.0.0.1
 
 显式选择活动提供商和模型。支持按阶段覆盖配置和单独启用的备用提供商；备用切换默认关闭。检索可配置 SearXNG 实例，或使用支持网页搜索的提供商选择 **AI_DIRECT**。后续结构化筛选使用共同流程。
 
-API key 保存在操作系统 keyring 中，服务名称为 `AIJobApplicationWorkbench`，不回退到明文存储。ChatGPT OAuth 文件在 Windows 位于 `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/`，其他系统位于 `~/.config/AIJobApplicationWorkbench/chatgpt/`。凭据仅保存在本应用的本地环境中，不会提交到仓库。退出登录会删除本地 OAuth 状态，并尝试撤销授权。
+API key 保存在操作系统 keyring 中，服务名称为 `AIJobApplicationWorkbench`，不回退到明文存储。即使该 keyring 不可用，ChatGPT OAuth 仍可使用。OAuth 文件在 Windows 位于 `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/`，其他系统位于 `~/.config/AIJobApplicationWorkbench/chatgpt/`。访问令牌过期时只刷新一次，并且仅在尚未产生输出或启动工具时重试 Codex 操作。凭据仅保存在本应用的本地环境中，不会提交到仓库。退出登录会删除本地 OAuth 状态，并尝试撤销授权。
 
 ## 简历、求职信与刷新
 
 **REUSE** 复制合适的已有简历。**ADAPT** 保留项目集合，调整有依据的内容。**CREATE** 在来源充分时选择四个相关且有依据的项目，否则只使用实际可用的相关项目，数量为一至四个；可以登记可复用版本。绝不编造第四个项目。求职信使用相同项目上下文，生成五段有来源支持的内容。
 
-准备和刷新使用面向招聘者的自然表达、事实依据、有意义且易读的指标，不输出原始日志或基准记录，使用易于理解的项目名称，并进行最终编辑检查。应用支持 DOCX 布局、技能平衡和验证。简历沿用模板语言，求职信沿用职位语言。应用界面以及分析、公司资料、面试准备的标题为英文。
+准备和刷新使用面向招聘者的自然表达、事实依据、有意义且易读的指标，不输出原始日志或基准记录，使用易于理解的项目名称，并进行最终编辑检查。每个选中项目必须包含一条由本地 Markdown 来源支持的量化要点；如果没有可用指标，则明确记录待人工审核的测量缺口。系统可按职位选择 `01_Career/Certifications.md` 中有依据的相关证书，并在技能栏目中显示且不重复技能。应用支持 DOCX 布局、技能平衡和验证。简历沿用模板语言，求职信沿用职位语言。应用界面以及分析、公司资料、面试准备的标题为英文。
+
+技能缺口只保留在内部分析中，不以防御性措辞写入求职信。未被证据支持的技术会被省略，分号和长破折号会被规范化，最终 DOCX 在替换已有文档前应用相同的编辑规则。
 
 刷新 REVIEW/SUBMIT 中符合条件且尚未发送的简历，无需重新创建申请。先检查 dry-run，再生成待审 DOCX，人工审核后应用：
 
@@ -132,4 +140,4 @@ npm run build
 ## 文档
 
 - [外部知识库与模板格式](docs/knowledge-base.zh-CN.md)
-- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) — 可选的配套仓库，提供可复用的 AI 知识工作流。
+- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) - 可选的配套仓库，提供可复用的 AI 知识工作流。

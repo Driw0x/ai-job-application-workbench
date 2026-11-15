@@ -149,7 +149,8 @@ def test_custom_mode_never_reads_career_and_mode_persists_with_kb(tmp_path, monk
             return super().run(prompt, *args, **kwargs)
 
     codex = IsolatedCodex()
-    client.app.state.codex_client = codex
+    client.app.state.codex_factory = lambda _: codex
+    client.app.state.codex_client = None
     initial = client.get("/settings/search-profile").json()
     if kb_state == "missing":
         with connect(client.app.state.db_path) as db:

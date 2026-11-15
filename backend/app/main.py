@@ -10,7 +10,7 @@ import tempfile
 import threading
 import unicodedata
 from collections import deque
-from contextlib import nullcontext, asynccontextmanager, closing
+from contextlib import nullcontext, asynccontextmanager, closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .chatgpt_auth import ChatGPTAuth
+from .chatgpt_auth import ChatGPTAuth, ChatGPTRefreshError
 from .ai_providers import (
     ANTHROPIC_PROVIDER, API_PROVIDERS, DEEPSEEK_PROVIDER, EMPTY_CAPABILITIES,
     GEMINI_PROVIDER, OPENAI_CAPABILITIES, OPENAI_PROVIDER, PROVIDER_LABELS, REASONING_EFFORTS,
@@ -38,6 +38,7 @@ from .application_artifacts import (
 from .codex_client import (
     CodexClient, CodexError, CodexStructuredOutputError, WebSearchNotExecutedError,
 )
+from .cv_quantification import validate_cv_quantification
 from .cv_documents import (
     cv_template_path,
     CvDocumentError, convert_cv_to_ats, create_cv, cv_variants, document_text, next_variant_name,
@@ -83,7 +84,7 @@ DEFAULT_APPLICATIONS_ROOT = APP_ROOT / "data" / "applications"
 CV_ROOT = REPO_ROOT / "01_Career" / "CV" / "Generated"
 DEFAULT_MAX_OFFER_AGE_DAYS = 90
 INTERVIEW_STATUSES = {"HR_INTERVIEW", "TECH_INTERVIEW", "FINAL_INTERVIEW"}
-INACTIVE_STATUSES = {"WITHDRAWN", "IGNORED"}
+INACTIVE_STATUSES = {"REJECTED", "WITHDRAWN", "NO_RESPONSE", "IGNORED"}
 LOGGER = logging.getLogger(__name__)
 
 STATUSES = {
@@ -1257,9 +1258,8 @@ def create_app(
             yield
         finally:
             try:
-                client = app.state.codex_client
-                if client is not None and hasattr(client, "close"):
-                    client.close()
+                with app.state.codex_client_lock:
+                    retire_codex_client()
             finally:
                 if auth is None:
                     app.state.auth.close()
@@ -1281,6 +1281,8 @@ def create_app(
         **(provider_factories or {}),
     }
     api.state.codex_client = None
+    api.state.codex_client_token = None
+    api.state.codex_client_users = {}
     api.state.offer_http_client_factory = offer_http_client_factory or (
         lambda: httpx.Client(timeout=10, headers={"User-Agent": "job-tracker-local/1.0"})
     )
@@ -1448,15 +1450,37 @@ def create_app(
             raise HTTPException(409, "Select a model")
         return rows.get("ai_provider", OPENAI_PROVIDER), rows["ai_auth_mode"], rows["ai_model"], rows.get("ai_reasoning_effort", "medium")
 
-    def codex():
+    def retire_codex_client() -> None:
+        client = api.state.codex_client
+        api.state.codex_client = None
+        api.state.codex_client_token = None
+        if client is not None and not api.state.codex_client_users.get(client) and hasattr(client, "close"):
+            client.close()
+
+    @contextmanager
+    def codex(rejected_token: str | None = None):
+        with api.state.codex_client_lock:
+            try:
+                token = (api.state.auth.access_token() if rejected_token is None
+                         else api.state.auth.access_token(rejected_token=rejected_token))
+            except PermissionError as error:
+                raise HTTPException(401, "ChatGPT session expired. Sign in again.") from error
+            if api.state.codex_client is None or token != api.state.codex_client_token:
+                client = api.state.codex_factory(token)
+                retire_codex_client()
+                api.state.codex_client = client
+                api.state.codex_client_token = token
+            client = api.state.codex_client
+            api.state.codex_client_users[client] = api.state.codex_client_users.get(client, 0) + 1
         try:
-            token = api.state.auth.access_token()
+            yield client, token
+        finally:
             with api.state.codex_client_lock:
-                if api.state.codex_client is None:
-                    api.state.codex_client = api.state.codex_factory(token)
-                return api.state.codex_client
-        except PermissionError as error:
-            raise HTTPException(401, "ChatGPT session expired. Sign in again.") from error
+                api.state.codex_client_users[client] -= 1
+                if not api.state.codex_client_users[client]:
+                    del api.state.codex_client_users[client]
+                    if client is not api.state.codex_client and hasattr(client, "close"):
+                        client.close()
 
     def api_provider(provider_id: str):
         if provider_id not in API_PROVIDERS:
@@ -1468,16 +1492,20 @@ def create_app(
 
     def provider_error(error: Exception) -> HTTPException:
         status = getattr(error, "status_code", None)
+        if isinstance(error, ChatGPTRefreshError):
+            return HTTPException(status, str(error))
         if isinstance(error, WebSearchNotExecutedError):
             return HTTPException(502, str(error))
-        if isinstance(error, CodexError) and ("token_expired" in str(error) or "401 Unauthorized" in str(error)):
+        if isinstance(error, CodexError) and error.token_expired:
             return HTTPException(401, "ChatGPT session expired. Sign in again.")
         if status == 401:
-            return HTTPException(401, "Invalid API key")
+            return HTTPException(401, "ChatGPT authentication refused." if isinstance(error, CodexError) else "Invalid API key")
         if status == 403:
             return HTTPException(403, "Insufficient permission")
         if status == 429:
             return HTTPException(429, "Quota unavailable")
+        if isinstance(error, httpx.RequestError):
+            return HTTPException(502, "AI provider network error. Try again later.")
         if isinstance(error, (CodexError, OSError)):
             return HTTPException(502, f"Codex app-server unavailable : {error}")
         return HTTPException(502, "Provider unavailable")
@@ -1485,8 +1513,12 @@ def create_app(
     def models_for(provider_id: str, auth_mode: str) -> list[dict[str, Any]]:
         provider = None
         try:
-            provider = codex() if auth_mode == "chatgpt_oauth" else api_provider(provider_id)
-            models = provider.models()
+            if auth_mode == "chatgpt_oauth":
+                with codex() as (provider, _):
+                    models = provider.models()
+            else:
+                provider = api_provider(provider_id)
+                models = provider.models()
         except HTTPException:
             raise
         except Exception as error:
@@ -1561,23 +1593,43 @@ def create_app(
         provider_id: str, auth_mode: str, category: str, operation: str, isolated: bool = False,
     ) -> dict[str, Any]:
         try:
-            provider = codex() if auth_mode == "chatgpt_oauth" else api_provider(provider_id)
-            metadata = {}
-            try:
-                with tempfile.TemporaryDirectory() if isolated and isinstance(provider, CodexClient) else nullcontext(None) as isolated_cwd:
-                    options = {"isolated_cwd": isolated_cwd} if isolated_cwd is not None else {}
-                    raw = provider.run(prompt, model, schema, effort=effort, web_search=web_search, **options)
-                metadata = getattr(raw, "run_metadata", {})
-                return raw
-            except Exception as error:
-                metadata = getattr(error, "metadata", {})
-                raise
-            finally:
+            rejected_token = None
+            for attempt in range(2):
+                token = None
                 try:
-                    record_usage(provider_id, model, category, operation, metadata)
-                finally:
-                    if auth_mode != "chatgpt_oauth" and hasattr(provider, "close"):
-                        provider.close()
+                    session = (codex(rejected_token) if auth_mode == "chatgpt_oauth"
+                               else nullcontext((api_provider(provider_id), None)))
+                    with session as (provider, token):
+                        metadata = {}
+                        try:
+                            with tempfile.TemporaryDirectory() if isolated and isinstance(provider, CodexClient) else nullcontext(None) as isolated_cwd:
+                                options = {"isolated_cwd": isolated_cwd} if isolated_cwd is not None else {}
+                                raw = provider.run(prompt, model, schema, effort=effort, web_search=web_search, **options)
+                            metadata = getattr(raw, "run_metadata", {})
+                            return raw
+                        except Exception as error:
+                            metadata = getattr(error, "metadata", {})
+                            raise
+                        finally:
+                            try:
+                                record_usage(provider_id, model, category, operation, metadata)
+                            finally:
+                                if auth_mode != "chatgpt_oauth" and hasattr(provider, "close"):
+                                    provider.close()
+                except CodexError as error:
+                    if auth_mode != "chatgpt_oauth" or attempt or not error.token_expired:
+                        raise
+                    if not error.retry_safe:
+                        if error.metadata.get("status") == "failed":
+                            with codex(token):
+                                pass
+                            raise HTTPException(
+                                409,
+                                "ChatGPT session refreshed, but generation stopped after partial work. Retry manually.",
+                            ) from error
+                        raise
+                    rejected_token = token
+                    LOGGER.info("ChatGPT token rejected before output; renewing once for operation=%s", operation)
         except HTTPException:
             raise
         except (CodexStructuredOutputError, ValidationError, ValueError):
@@ -1930,7 +1982,7 @@ def create_app(
 
     @api.get("/auth/chatgpt/start")
     def chatgpt_start(request: Request) -> dict[str, str]:
-        redirect_uri = str(request.url_for("chatgpt_callback"))
+        redirect_uri = os.environ.get("CHATGPT_OAUTH_REDIRECT_URI") or str(request.url_for("chatgpt_callback"))
         return {"authorization_url": api.state.auth.start(redirect_uri)}
 
     @api.get("/auth/chatgpt/callback", response_class=HTMLResponse)
@@ -1944,11 +1996,8 @@ def create_app(
     @api.post("/auth/chatgpt/logout")
     def chatgpt_logout() -> dict[str, bool]:
         with api.state.codex_client_lock:
-            client = api.state.codex_client
-            if client is not None and hasattr(client, "close"):
-                client.close()
-        api.state.codex_client = None
-        api.state.auth.logout()
+            api.state.auth.logout()
+            retire_codex_client()
         with closing(database()) as db:
             rows = settings(db, "ai_auth_mode")
             if rows.get("ai_auth_mode") == "chatgpt_oauth":
@@ -2164,8 +2213,8 @@ def create_app(
         auth_status = api.state.auth.status()
         try:
             api_keys = {provider: api.state.api_key_store.get(provider) for provider in API_PROVIDERS}
-        except Exception as error:
-            raise HTTPException(502, "Secure credential storage unavailable") from error
+        except Exception:
+            api_keys = dict.fromkeys(API_PROVIDERS)
         with closing(database()) as db:
             rows = dict(db.execute("SELECT key, value FROM settings"))
         auth_mode = rows.get("ai_auth_mode")
@@ -3128,6 +3177,10 @@ def create_app(
                     else f"resume_{slugify(application['company'])}_{slugify(application['position'])}.docx"
                 )
             )
+            if not application["cv_path"]:
+                partial_cvs = list(cv_folder.glob("*.docx"))
+                if len(partial_cvs) == 1:
+                    filename = partial_cvs[0].name
             if Path(filename).name != filename or Path(filename).suffix.lower() != ".docx":
                 raise HTTPException(422, "Invalid resume filename")
             destination = cv_folder / filename
@@ -3146,6 +3199,10 @@ def create_app(
                     if decision.content else None
                 )
                 validate_cv_projects(destination, decision.project_order, catalog, rendered_titles)
+                metric_warnings = validate_cv_quantification(
+                    api.state.repo_root, destination, decision.project_order, decision.project_metrics,
+                    output.local_sources, rendered_titles,
+                )
             except CvDocumentError as error:
                 raise HTTPException(422, f"Unable to create resume : {error}") from error
 
@@ -3153,6 +3210,8 @@ def create_app(
             base = decision.source_variant or "base template"
             retained = "; ".join(decision.changes) or "Source resume retained unchanged"
             gaps = "; ".join(decision.missing_fit) or "No additional gaps reported"
+            if metric_warnings:
+                gaps += "; " + "; ".join(metric_warnings)
             analysis_cv = (
                 f"\n\n## Resume decision\n\n"
                 f"- Action : `{decision.action}`\n"
@@ -3230,6 +3289,10 @@ def create_app(
                             project.project_id: project.title for project in decision.reusable_content.projects
                         }
                         validate_cv_projects(variant_path, reusable_order, catalog, reusable_titles)
+                        validate_cv_quantification(
+                            api.state.repo_root, variant_path, reusable_order, decision.project_metrics,
+                            output.local_sources, reusable_titles,
+                        )
                         register_variant(
                             api.state.repo_root, generated_variant, reusable_order,
                             catalog, decision.reusable_content.headline,
@@ -3263,6 +3326,7 @@ def create_app(
                     "thread_id": run_metadata.get("thread_id"),
                     "turn_id": run_metadata.get("turn_id"),
                     "local_sources": output.local_sources,
+                    "project_metrics": [review.model_dump() for review in decision.project_metrics],
                     "cover_letter": {"path": paths["cover_letter_path"], "validated": True},
                     "missing_information": missing_information,
                 }, ensure_ascii=False))

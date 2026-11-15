@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -56,6 +57,42 @@ INTERNAL_SOURCE = re.compile(
     r"(?:Source(?:s)? locale(?:s)?|SOURCE LOCALE)|(?:01_Career|02_Projects|03_Knowledge)[\\/]",
     re.IGNORECASE,
 )
+COVER_LETTER_WRITING_RULES = """RÈGLES RÉDACTIONNELLES DE LA LETTRE (toutes langues et variantes) :
+- Rédige une lettre positive, factuelle, professionnelle, naturelle et affirmative, sans survente.
+- Utilise uniquement la formation, les compétences acquises, les projets réalisés, les technologies
+  effectivement utilisées et les résultats vérifiables dans les sources candidat fournies.
+- Ne mentionne jamais une absence de compétence, d'expérience ou de maîtrise, même pour la nuancer.
+  N'inclus ni formulation négative ou défensive, ni lacune à combler pendant le stage, ni souhait de
+  développer des compétences sur une technologie non pratiquée. Les écarts restent dans l'analyse
+  interne et la préparation d'entretien ; ils ne doivent pas être repris dans la lettre.
+- Si une technologie de l'offre n'a pas été utilisée selon les sources candidat, omets-la entièrement
+  de la lettre. Ne la présente ni comme acquise ni comme un objectif d'apprentissage.
+- N'invente aucune compétence ou expérience pour compenser une lacune, aucun résultat chiffré,
+  aucune qualité personnelle sans exemple. N'exagère pas la maturité des projets : décris positivement
+  leur périmètre réel (prototype local, évaluation offline, simulation, formation en cours).
+- Relie des réalisations concrètes aux missions précises de l'offre et motive l'intérêt pour ces
+  missions avec ses éléments spécifiques. Évite les affirmations génériques non justifiées.
+- N'utilise jamais de point-virgule (;). N'utilise jamais de tiret cadratin (—) : utilise un tiret
+  simple (-) à la place.
+- Avant de retourner le JSON, relis chaque paragraphe : remplace tout passage défensif ou spéculatif
+  par une réalisation pertinente vérifiée, ou supprime-le en conservant une lettre cohérente.
+"""
+SKILL_GAP_WRITING = re.compile(
+    r"\b(?:domaines?|environnements?|axes)\b[^.!?\n]{0,100}\ba approfondir\b"
+    r"|\b(?:je|j')\s*(?:n[' ]|ne\b)[^.!?\n]{0,100}\b(?:maitris|experien|utilis|pratiqu|occasion|acquis)"
+    r"|\b(?:sans|manque d[' ]|absence d[' ])\s*(?:\w+\s+){0,3}(?:competence|experience|maitrise|pratique)"
+    r"|\b(?:experience|pratique|maitrise)\b[^.!?\n]{0,70}\b(?:limitee?|a acquerir|a developper)\b"
+    r"|\b(?:pas encore|non)\s+(?:demontre|documente|atteste|acquis|maitris|pratiqu)"
+    r"|\b(?:ne|n')\s*[^.!?\n]{0,60}\b(?:constitue|demontre|porte|presente)[^.!?\n]{0,35}\b(?:pas|ni)\b"
+    r"|\bje souhaite\s+(?:\w+\s+){0,3}(?:approfondir pendant (?:le|ce) stage|developper mes competences|developper ma pratique)\b"
+    r"|\b(?:domaines?|competences?)\b[^.!?\n]{0,80}\b(?:a apprendre|a combler)\b"
+    r"|\breste(?:nt)? a (?:construire|acquerir|apprendre|maitriser)\b"
+    r"|\bi\s+(?:(?:do not|don't|have not|haven't|lack)\b[^.!?\n]{0,100}\b(?:experience|used|skills|master|opportunity)"
+    r"|(?:would |will )?need to (?:learn|deepen|develop)\b)"
+    r"|\bmy (?:experience|knowledge|skills)\b[^.!?\n]{0,60}\b(?:limited|lacking)\b"
+    r"|\b(?:skills?|knowledge|experience) gaps?\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +138,21 @@ class CoverLetterTemplateError(CoverLetterError):
             details.append(f"duplicate_placeholders={list(self.duplicate_placeholders)!r}")
         suffix = f" ({', '.join(details)})" if details else ""
         super().__init__(f"{self.code}: {message}{suffix}")
+
+
+def validate_cover_letter_writing(text: str) -> None:
+    if ";" in text or "—" in text:
+        raise CoverLetterError("The cover letter contains a forbidden semicolon or em dash.")
+    normalized = unicodedata.normalize("NFKD", text.replace("\u2019", "'")).encode("ascii", "ignore").decode()
+    if SKILL_GAP_WRITING.search(normalized):
+        raise CoverLetterError(
+            "The cover letter contains defensive skill-gap wording. "
+            "Use only verified achievements related to the role."
+        )
+
+
+def normalize_cover_letter_punctuation(text: str) -> str:
+    return text.replace(";", ",").replace("—", "-")
 
 
 def cover_letter_template_path(repo: Path) -> Path:
@@ -306,6 +358,7 @@ def validate_cover_letter_content(
         raise CoverLetterError("Cover letter contains a forbidden placeholder")
     if INTERNAL_SOURCE.search(text):
         raise CoverLetterError("Knowledge Base reference forbidden in cover letter")
+    validate_cover_letter_writing("\n".join(content.paragraphs))
     keywords = [word.casefold() for word in re.findall(r"[\wÀ-ÿ-]{6,}", position)]
     if keywords and not any(word in text.casefold() for word in keywords):
         raise CoverLetterError("Cover letter does not match the position")
@@ -328,6 +381,7 @@ def validate_cover_letter_docx(
     if PLACEHOLDER.search(text):
         raise CoverLetterError("Cover letter DOCX contains an unresolved placeholder")
     content = read_cover_letter_docx(path)
+    validate_cover_letter_writing("\n".join(content.paragraphs))
     if company and company.casefold() not in text.casefold():
         raise CoverLetterError("Recipient missing from cover-letter DOCX")
     if signature_name and signature_name.casefold() not in text.casefold():

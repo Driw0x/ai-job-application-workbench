@@ -14,6 +14,7 @@ candidate-knowledge-base/
     Profile.md
     Domains.md
     Job Search.md
+    Certifications.md
     CV/
       Templates/resume-template.docx
       Generated/resume_A.docx
@@ -42,18 +43,20 @@ Documentez parcours, compétences, contraintes et résultats réels des projets.
 
 Les dossiers de `02_Projects` définissent les identifiants canoniques. Fournissez des preuves Markdown factuelles pour chaque projet. Sélectionnez quatre projets distincts pertinents lorsqu'ils existent ; utilisez moins de projets plutôt que d'inventer. La découverte par prompt personnalisé utilise uniquement ses critères enregistrés, sans cette KB. Les CV/lettres exigent toujours sources candidat et templates.
 
+`01_Career/Certifications.md` est facultatif. Lorsqu'il existe, documentez pour chaque justificatif l'organisme, la date, le type, l'URL, le périmètre évalué et ses limites. Le modèle sélectionne seulement les justificatifs pertinents pour l'offre. Il ne transforme pas un badge ou une certification de fondamentaux en preuve d'expérience en production.
+
 ## Template de CV
 
 Fournissez votre propre `01_Career/CV/Templates/resume-template.docx`. Aucun template personnel inclus. Si `Templates` contient exactement un DOCX portant un autre nom, il est sélectionné automatiquement. Avec plusieurs templates, utilisez le nom préféré pour lever toute ambiguïté. Le générateur accepte les anciens templates à deux colonnes et les templates ATS. Les trois premiers paragraphes portent le nom, la formation et le titre personnalisé ; les coordonnées suivent. Tous les outputs utilisent le même modèle ATS A4 portrait, une seule colonne, Arial, sans tableaux ni zones flottantes. Les rubriques suivent l'ordre `PROFIL`, `COMPÉTENCES`, `PROJETS`, `FORMATION`, `EXPÉRIENCES`, `LANGUES`, `CENTRES D'INTÉRÊT`. Les anciens titres anglais et français sont reconnus. Les rubriques sans faits documentés ne sont pas inventées.
 
-Identité, contacts, formation et autres faits statiques sont conservés. Les compétences comportent quatre groupes de trois à cinq éléments, affichés sur des lignes compactes. Chaque nouveau projet comporte titre, technologies, description et deux à trois puces. REUSE conserve le contenu et applique le rendu ATS ; ADAPT et CREATE personnalisent les faits documentés. Les liens cliquables sont regroupés avec les coordonnées dans l'en-tête. La génération ne retire aucun contenu pour forcer une page ; la pagination finale Word/PDF exige une revue humaine.
+Identité, contacts, formation et autres faits statiques sont conservés. Les compétences comportent quatre groupes de trois à cinq éléments, affichés sur des lignes compactes. Les justificatifs sélectionnés apparaissent sur une ligne supplémentaire sous `COMPÉTENCES & CERTIFICATIONS` ; une sélection vide conserve le titre `COMPÉTENCES`. Chaque nouveau projet comporte titre, technologies, description et deux à trois puces. Chaque projet sélectionné doit inclure une puce quantifiée utile, appuyée par une note projet ou connaissance citée. Si aucune métrique utile n'est documentée, la génération conserve le projet et signale la mesure manquante pour revue humaine. REUSE conserve le contenu et applique le rendu ATS ; ADAPT et CREATE personnalisent les faits documentés. Les liens cliquables sont regroupés avec les coordonnées dans l'en-tête. La génération ne retire aucun contenu pour forcer une page ; la pagination finale Word/PDF exige une revue humaine.
 
 ## Variantes et refresh
 
 Les fichiers générés s'appellent `resume_A.docx`, `resume_B.docx`, etc. Un unique ancien `*_A.docx` fonctionne aussi. `CV_Variants.md` associe une variante à un à quatre noms de dossiers de projets exacts et distincts :
 
 ```markdown
-## Variant A — General profile
+## Variant A - General profile
 
 Projects :
 

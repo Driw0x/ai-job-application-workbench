@@ -54,6 +54,12 @@ npm run dev -- --host 127.0.0.1
 
 Ouvrez `http://127.0.0.1:5173`. Documentation API : `http://127.0.0.1:8000/docs`. Gardez les deux services sur loopback ; l'application ne possède pas de contrôle d'accès multi-utilisateur.
 
+Sous Windows, `./start.ps1` démarre les deux services après installation et arrête leurs processus avec Ctrl+C.
+
+### Docker / NAS
+
+Définissez `KNOWLEDGE_BASE_PATH` avec le chemin hôte de votre KB privée, puis lancez `docker compose -f compose.nas.yml up -d --build`. L'interface écoute par défaut sur le port `8080`, modifiable avec `JOB_TRACKER_PORT`. Définissez `PUID` et `PGID` si l'utilisateur NAS n'est pas `1000:1000`. Pour OAuth ChatGPT derrière un nom NAS ou un reverse proxy, définissez `CHATGPT_OAUTH_REDIRECT_URI` avec l'URL publique terminant par `/auth/callback`. Le fichier Compose expose l'application sur le réseau local ; utilisez un réseau de confiance ou un reverse proxy authentifié, car l'application n'a pas de contrôle d'accès multi-utilisateur.
+
 ## Configuration et Knowledge Base
 
 Copiez `.env.example` localement. Définissez `KNOWLEDGE_BASE_PATH` vers votre KB externe, ou enregistrez son dossier dans Search profile. Le dossier enregistré est prioritaire sur l'environnement aux démarrages suivants et sert à la recherche comme aux documents. Sélectionnez les sources Markdown dans le dashboard. La KB peut décrire profil, compétences, formation, expérience, projets, contraintes et variantes de CV. Seuls les faits documentés peuvent être utilisés.
@@ -72,13 +78,15 @@ Pour **OpenAI API**, saisissez une clé dans les paramètres, testez/enregistrez
 
 Sélectionnez explicitement provider et modèle actifs. Des overrides par étape et un fallback activé séparément sont disponibles ; le fallback est désactivé par défaut. Configurez votre instance SearXNG ou choisissez **AI_DIRECT** avec un provider Web compatible. L'évaluation structurée utilise ensuite le pipeline commun.
 
-Les clés API utilisent le keyring système, service `AIJobApplicationWorkbench`, sans repli en texte brut. Les fichiers OAuth ChatGPT se trouvent dans `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/` sous Windows ou `~/.config/AIJobApplicationWorkbench/chatgpt/` ailleurs. Les credentials sont stockés localement pour cette application et ne sont jamais commités dans le repository. La déconnexion supprime l'état OAuth local et tente une révocation.
+Les clés API utilisent le keyring système, service `AIJobApplicationWorkbench`, sans repli en texte brut. OAuth ChatGPT reste disponible si ce keyring ne l'est pas. Ses fichiers se trouvent dans `%LOCALAPPDATA%/AIJobApplicationWorkbench/chatgpt/` sous Windows ou `~/.config/AIJobApplicationWorkbench/chatgpt/` ailleurs. Un token expiré est renouvelé une fois et une opération Codex n'est retentée que si aucun output ni outil n'a démarré. Les credentials sont stockés localement pour cette application et ne sont jamais commités dans le repository. La déconnexion supprime l'état OAuth local et tente une révocation.
 
 ## CV, lettres et refresh
 
 **REUSE** copie un CV existant adapté. **ADAPT** conserve son ensemble de projets en adaptant les faits documentés. **CREATE** choisit quatre projets pertinents documentés lorsqu'ils existent, sinon uniquement les projets pertinents disponibles, de un à quatre ; il peut enregistrer une variante réutilisable. Aucun quatrième projet inventé. Le contexte de lettre utilise les mêmes projets sélectionnés, avec cinq paragraphes fondés sur les sources.
 
-La préparation et le refresh utilisent une formulation naturelle destinée aux recruteurs, des faits vérifiables, des métriques utiles et lisibles, sans logs ni benchmarks bruts, avec des noms de projets compréhensibles et une revue éditoriale finale. La mise en page DOCX, l'équilibrage des compétences et la validation sont pris en charge. Le CV suit la langue du template ; la lettre suit celle de l'offre. L'interface et les titres des analyses, profils d'entreprise et préparations d'entretien sont en anglais.
+La préparation et le refresh utilisent une formulation naturelle destinée aux recruteurs, des faits vérifiables, des métriques utiles et lisibles, sans logs ni benchmarks bruts, avec des noms de projets compréhensibles et une revue éditoriale finale. Chaque projet sélectionné doit fournir une puce quantifiée appuyée par une source Markdown locale citée, ou signaler explicitement une mesure manquante pour revue humaine. Les justificatifs pertinents documentés dans `01_Career/Certifications.md` peuvent être sélectionnés selon l'offre et intégrés à la rubrique compétences sans les dupliquer. La mise en page DOCX, l'équilibrage des compétences et la validation sont pris en charge. Le CV suit la langue du template ; la lettre suit celle de l'offre. L'interface et les titres des analyses, profils d'entreprise et préparations d'entretien sont en anglais.
+
+Les lacunes restent dans l'analyse interne au lieu d'apparaître sous forme défensive dans la lettre. Les technologies non démontrées sont omises, les points-virgules et tirets cadratins sont normalisés, et la validation DOCX finale applique les mêmes règles avant de remplacer un document existant.
 
 Actualisez les CV REVIEW/SUBMIT éligibles non envoyés sans recréer les candidatures. Inspectez le dry-run, générez une version à relire, relisez manuellement les DOCX, puis appliquez :
 
@@ -142,4 +150,4 @@ Validez chaque affirmation et document avant utilisation. Le grounding ne rempla
 ## Documentation
 
 - [Knowledge Base externe et contrat des templates](docs/knowledge-base.fr.md)
-- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) — Dépôt compagnon facultatif consacré à des workflows IA réutilisables autour des connaissances.
+- [AI Knowledge Workflows](https://github.com/Driw0x/ai-knowledge-workflows) - Dépôt compagnon facultatif consacré à des workflows IA réutilisables autour des connaissances.

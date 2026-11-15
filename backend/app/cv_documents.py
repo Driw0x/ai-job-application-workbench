@@ -13,6 +13,7 @@ from docx import Document
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 CV_HEADINGS = {
     "PROFILE": "PROFIL", "SKILLS": "COMPÉTENCES", "LANGUAGES": "LANGUES",
+    "COMPÉTENCES & CERTIFICATIONS": "COMPÉTENCES",
     "SELECTED PROJECTS": "PROJETS", "PROJETS SÉLECTIONNÉS": "PROJETS", "PROJECTS": "PROJETS",
     "EDUCATION": "FORMATION", "EXPERIENCE": "EXPÉRIENCES", "INTERESTS": "CENTRES D'INTÉRÊT", "LINKS": "LIENS",
 }
@@ -78,10 +79,15 @@ def cv_variants(repo: Path) -> dict[str, dict[str, object]]:
 
 def next_variant_name(variants: dict[str, object]) -> str:
     used = set(variants)
-    for code in range(ord("A"), ord("Z") + 1):
-        if (candidate := chr(code)) not in used:
+    number = 1
+    while True:
+        value, candidate = number, ""
+        while value:
+            value, remainder = divmod(value - 1, 26)
+            candidate = chr(ord("A") + remainder) + candidate
+        if candidate not in used:
             return candidate
-    raise CvDocumentError("No variant identifier available")
+        number += 1
 
 
 def register_variant(repo: Path, variant: str, project_order: list[str], catalog: dict[str, str], headline: str) -> None:
@@ -122,7 +128,7 @@ ATS_SECTIONS = ("PROFIL", "COMPÉTENCES", "PROJETS", "FORMATION", "EXPÉRIENCES"
 
 def validate_cv_layout(path: Path) -> None:
     document = Document(path)
-    lines = document_text(path).splitlines()
+    lines = [CV_HEADINGS.get(line, line) for line in document_text(path).splitlines()]
     try:
         positions = [lines.index(title) for title in ATS_SECTIONS if title in lines]
         if not all(title in lines for title in ("PROFIL", "COMPÉTENCES", "PROJETS", "FORMATION", "LANGUES")):
@@ -218,6 +224,67 @@ def _compact_skills(lines: list[str]) -> list[str]:
     return compact
 
 
+def cv_skill_lines(skill_groups: list, certifications: list) -> list[str]:
+    lines = [group.title + " : " + " · ".join(group.items) for group in skill_groups]
+    if certifications:
+        years = {item.year for item in certifications}
+        year = next(iter(years)) if len(years) == 1 else None
+        labels = [item.label + (f" ({item.year})" if year is None and item.year else "")
+                  for item in certifications]
+        lines.append("Certifications et badges" + (f" ({year})" if year else "") + " : " + " · ".join(labels))
+    return lines
+
+
+def update_cv_skills(source: Path, destination: Path, skill_groups: list, certifications: list,
+                     replace: bool = False) -> None:
+    """Replace only the skills paragraphs, preserving manual edits elsewhere verbatim."""
+    from copy import deepcopy
+    from docx.shared import Pt
+
+    if destination.exists() and not replace:
+        raise CvDocumentError(f"Target resume already exists : {destination.name}")
+    validate_cv_layout(source)
+    document = Document(source)
+    paragraphs = document.paragraphs
+    start = next(i for i, p in enumerate(paragraphs) if CV_HEADINGS.get(p.text, p.text) == "COMPÉTENCES")
+    end = next(i for i in range(start + 1, len(paragraphs)) if paragraphs[i].text in ATS_SECTIONS)
+    heading = paragraphs[start]
+    template = paragraphs[start + 1]
+    for p in paragraphs[start + 1:end]:
+        p._p.getparent().remove(p._p)
+    # Keep the existing heading and paragraph properties, including custom formatting.
+    heading.runs[0].text = "COMPÉTENCES & CERTIFICATIONS" if certifications else "COMPÉTENCES"
+    for run in heading.runs[1:]:
+        run.text = ""
+    if certifications:
+        heading.paragraph_format.space_before = Pt(3)
+        heading.paragraph_format.space_after = Pt(2)
+    anchor = heading._p
+    for text in cv_skill_lines(skill_groups, certifications):
+        node = deepcopy(template._p)
+        anchor.addnext(node)
+        from docx.text.paragraph import Paragraph
+        p = Paragraph(node, heading._parent)
+        p.clear()
+        label, separator, rest = text.partition(" : ")
+        p.add_run(label).bold = True
+        p.add_run(separator + rest)
+        if certifications:
+            p.paragraph_format.line_spacing = 1.0
+            p.paragraph_format.space_after = Pt(0)
+        anchor = node
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".docx", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        document.save(temporary)
+        validate_docx(temporary)
+        validate_cv_layout(temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def document_hyperlinks(path: Path) -> dict[str, str]:
     """Read visible links, including referenced headers and footers, excluding stale parts."""
     from docx.oxml.ns import qn
@@ -256,7 +323,7 @@ def convert_cv_to_ats(source: Path, destination: Path, content: object | None = 
     if content is not None:
         header[2] = content.headline
         sections["PROFIL"] = [content.profile]
-        sections["COMPÉTENCES"] = [group.title + " : " + " · ".join(group.items) for group in content.skill_groups]
+        sections["COMPÉTENCES"] = cv_skill_lines(content.skill_groups, content.certifications)
         sections["PROJETS"] = [line for project in content.projects for line in (
             project.title + "  |  " + project.technologies, project.description,
             *["• " + bullet for bullet in project.bullets],
@@ -379,7 +446,15 @@ def convert_cv_to_ats(source: Path, destination: Path, content: object | None = 
         values = sections.get(title, [])
         if not values:
             continue
-        rule(paragraph(title, "Section"))
+        has_certifications = title == "COMPÉTENCES" and any(
+            value.startswith("Certifications et badges") for value in values
+        )
+        display_title = "COMPÉTENCES & CERTIFICATIONS" if has_certifications else title
+        heading = paragraph(display_title, "Section")
+        if has_certifications:
+            heading.paragraph_format.space_before = Pt(3)
+            heading.paragraph_format.space_after = Pt(2)
+        rule(heading)
         if title in {"LANGUES", "CENTRES D'INTÉRÊT"}:
             paragraph(" · ".join(value.removeprefix("• ") for value in values), "Last")
             continue
@@ -398,6 +473,9 @@ def convert_cv_to_ats(source: Path, destination: Path, content: object | None = 
                 p = document.add_paragraph(style="CV Skill")
                 add_text(p, first, bold=True, color=navy)
                 add_text(p, separator + rest)
+                if has_certifications:
+                    p.paragraph_format.line_spacing = 1.0
+                    p.paragraph_format.space_after = Pt(0)
             elif title in {"FORMATION", "EXPÉRIENCES"}:
                 paragraph(text, "Entry" if " | " in text else "Bullet" if text.startswith("• ") else "Entry Desc")
             else:

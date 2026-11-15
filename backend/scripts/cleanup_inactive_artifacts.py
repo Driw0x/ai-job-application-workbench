@@ -26,7 +26,9 @@ def cleanup_all(
 ) -> dict[str, object]:
     report: dict[str, object] = {
         "dry_run": dry_run,
+        "REJECTED": 0,
         "WITHDRAWN": 0,
+        "NO_RESPONSE": 0,
         "IGNORED": 0,
         "files": 0,
         "bytes": 0,
@@ -35,7 +37,7 @@ def cleanup_all(
     with connect(database_path) as db:
         rows = db.execute(
             "SELECT id, status FROM applications "
-            "WHERE status IN ('WITHDRAWN', 'IGNORED') ORDER BY id"
+            "WHERE status IN ('REJECTED', 'WITHDRAWN', 'NO_RESPONSE', 'IGNORED') ORDER BY id"
         ).fetchall()
         for row in rows:
             application = cleanup_inactive_application_artifacts(
@@ -50,7 +52,7 @@ def cleanup_all(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Clean generated artifacts for WITHDRAWN and IGNORED applications."
+        description="Clean generated artifacts for closed or ignored applications."
     )
     parser.add_argument(
         "--execute", action="store_true", help="Delete files (dry-run by default)."
