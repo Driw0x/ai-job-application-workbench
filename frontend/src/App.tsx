@@ -1,5 +1,4 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { renderAsync } from "docx-preview";
 import { matchPath, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -214,11 +213,17 @@ export default function App() {
       .catch(caught => { if (!controller.signal.aborted) { setSelected(null); setRouteError((caught as Error).message); } });
     return () => controller.abort();
   }, [routeApplicationId]);
+  const hasActivePreparation = applications.some(item => item.status === "SHORTLISTED" && ["queued", "running"].includes(item.preparation_state || ""));
   useEffect(() => {
-    if (!applications.some(item => item.status === "SHORTLISTED" && ["queued", "running"].includes(item.preparation_state || ""))) return;
-    const timer = window.setInterval(() => void refresh(), 2000);
+    if (!hasActivePreparation) return;
+    let pending = false;
+    const timer = window.setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      try { await refresh(); } finally { pending = false; }
+    }, 2000);
     return () => window.clearInterval(timer);
-  }, [applications, refresh]);
+  }, [hasActivePreparation, refresh]);
 
   const refreshAI = useCallback(async () => {
     try {
@@ -1258,6 +1263,8 @@ export function DocxPreview({ url, loadingLabel, missingLabel, errorLabel, onSta
       if (response.status === 404) throw new Error("missing");
       if (!response.ok) throw new Error("fetch");
       const content = await response.arrayBuffer();
+      if (!active) return;
+      const { renderAsync } = await import("docx-preview");
       if (!active) return;
       const target = document.createElement("div");
       await renderAsync(content, target, undefined, { breakPages: true, ignoreWidth: false, ignoreHeight: false, ignoreFonts: false });

@@ -4,7 +4,6 @@ import json
 import os
 import logging
 import re
-import shutil
 import sqlite3
 import tempfile
 import threading
@@ -42,7 +41,7 @@ from .cv_quantification import validate_cv_quantification
 from .cv_documents import (
     cv_template_path,
     CvDocumentError, convert_cv_to_ats, create_cv, cv_variants, document_text, next_variant_name,
-    project_catalog, register_variant, validate_cv_layout, validate_cv_projects, validate_docx,
+    project_catalog, register_variant, validate_cv_projects, validate_docx,
 )
 from .cv_pdf import (
     PdfExportError,

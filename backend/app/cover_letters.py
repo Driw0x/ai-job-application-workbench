@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import tempfile
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from time import sleep
 from typing import Iterable
 
 from docx import Document
@@ -335,7 +335,7 @@ def render_cover_letter_from_template(
             temporary = Path(handle.name)
         document.save(temporary)
         count = validate_cover_letter_docx(temporary, company, signature_name, position)
-        temporary.replace(output_path)
+        _replace_cover_letter(temporary, output_path)
         return count
     except (OSError, CoverLetterError) as error:
         if temporary:
@@ -343,6 +343,18 @@ def render_cover_letter_from_template(
         if isinstance(error, CoverLetterError):
             raise
         raise CoverLetterError(f"Unable to write cover letter DOCX : {error}") from error
+
+
+def _replace_cover_letter(temporary: Path, destination: Path) -> None:
+    # A concurrent DOCX reader can briefly block an atomic replacement on Windows.
+    for attempt in range(4):
+        try:
+            temporary.replace(destination)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or attempt == 3:
+                raise
+            sleep(0.05)
 
 
 def validate_cover_letter_content(
@@ -486,7 +498,7 @@ def migrate_cover_letter_docx(
         if cover_letter_date(temporary) != existing_date:
             raise CoverLetterError("Historical date was not preserved")
         validate_cover_letter_docx(temporary, company, contact.name, position)
-        os.replace(temporary, path)
+        _replace_cover_letter(temporary, path)
         temporary = None
         return True
     finally:

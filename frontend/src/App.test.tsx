@@ -2050,6 +2050,28 @@ describe("routing SPA", () => {
     else expect(funnel).not.toContain("observed web tools");
   });
 
+  it("attend la fin d'un rafraîchissement de préparation avant de relancer le polling", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const fetchMock = mockApi();
+      const initial = fetchMock.getMockImplementation()!;
+      let reads = 0;
+      let finish!: (response: Response) => void;
+      const pending = new Promise<Response>(resolve => { finish = resolve; });
+      fetchMock.mockImplementation(async input => {
+        if (!String(input).endsWith("/applications")) return initial(input);
+        if (++reads > 1) return pending;
+        return { ok: true, json: async () => [{ ...application, status: "SHORTLISTED", preparation_state: "running" }] } as Response;
+      });
+      await act(async () => root.render(<BrowserRouter><App /></BrowserRouter>)); await flush();
+      await act(async () => vi.advanceTimersByTimeAsync(6000));
+      expect(reads).toBe(2);
+      await act(async () => finish({ ok: true, json: async () => [{ ...application, status: "PREPARED" }] } as Response));
+      await act(async () => vi.advanceTimersByTimeAsync(4000));
+      expect(reads).toBe(2);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("actualise un run RUNNING externe, conserve son snapshot en erreur et arrête le polling au résultat", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     try {

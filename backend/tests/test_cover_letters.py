@@ -13,7 +13,7 @@ from app.cover_letters import (
     document_full_text, is_subject, migrate_markdown_cover_letter,
     migrate_cover_letter_docx, read_cover_letter_docx,
     missing_optional_cover_letter_values,
-    replace_in_runs, validate_cover_letter_docx,
+    _replace_cover_letter, replace_in_runs, validate_cover_letter_docx,
     validate_cover_letter_template, validate_cover_letter_writing,
 )
 from app.main import REPO_ROOT
@@ -80,6 +80,38 @@ def test_failed_markdown_migration_preserves_source(tmp_path: Path) -> None:
 
     assert markdown.exists()
     assert not (tmp_path / "lettre-motivation.docx").exists()
+
+
+@pytest.mark.parametrize("release_after", [1, 4])
+def test_replace_cover_letter_retries_windows_lock_without_removing_original(tmp_path, monkeypatch, release_after):
+    temporary = tmp_path / "new.docx"
+    destination = tmp_path / "letter.docx"
+    temporary.write_bytes(b"new")
+    destination.write_bytes(b"old")
+    original_replace = Path.replace
+    attempts = 0
+
+    def replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= release_after:
+            assert target.read_bytes() == b"old"
+            error = PermissionError("DOCX still open")
+            error.winerror = 5
+            raise error
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr("app.cover_letters.sleep", lambda _: None)
+    if release_after == 4:
+        with pytest.raises(PermissionError, match="DOCX still open"):
+            _replace_cover_letter(temporary, destination)
+        assert attempts == 4
+        assert destination.read_bytes() == b"old"
+    else:
+        _replace_cover_letter(temporary, destination)
+        assert attempts == 2
+        assert destination.read_bytes() == b"new"
 
 
 def test_real_template_respects_contract() -> None:
